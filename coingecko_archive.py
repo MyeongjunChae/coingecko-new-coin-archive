@@ -485,9 +485,7 @@ def _capture_coin(
     }
     pending_site: str | None = None
     try:
-        name, website, website_status, whitepaper, whitepaper_status = retry(
-            lambda: _coin_details(page, coin)
-        )
+        name, website, website_status, whitepaper, whitepaper_status = _coin_details(page, coin)
     except AccessWallError:
         raise
     except Exception as error:
