@@ -283,6 +283,8 @@ def retry(operation: Callable[[], T], attempts: int = RETRIES, delay: float = 1.
     for attempt in range(attempts):
         try:
             return operation()
+        except AccessWallError:
+            raise
         except Exception as error:
             last_error = error
             if attempt + 1 < attempts:
@@ -455,6 +457,16 @@ def _coin_details(page: Page, coin: Coin) -> tuple[str, str | None, str, str | N
     return name or coin.name, website, website_status, whitepaper, whitepaper_status
 
 
+def _save_full_page_screenshot(page: Page, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.stem + ".part" + target.suffix)
+    try:
+        retry(lambda: page.screenshot(path=str(temporary), full_page=True, timeout=90_000))
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _capture_coin(
     page: Page,
     coin: Coin,
@@ -476,30 +488,28 @@ def _capture_coin(
         name, website, website_status, whitepaper, whitepaper_status = retry(
             lambda: _coin_details(page, coin)
         )
-        details.update(
-            name=name,
-            website_url=website,
-            website_status=website_status,
-            whitepaper_url=whitepaper,
-            whitepaper_status=whitepaper_status,
-        )
+    except AccessWallError:
+        raise
     except Exception as error:
         details.update(status="needs_review", review=[f"coin_detail_failed:{type(error).__name__}"])
         return details, pending_site
-
+    details.update(
+        name=name,
+        website_url=website,
+        website_status=website_status,
+        whitepaper_url=whitepaper,
+        whitepaper_status=whitepaper_status,
+    )
     if website_status != "ok" or not website:
         details["review"].append(f"website_{website_status}")
     else:
         try:
             _navigate(page, website)
             screenshot = output_path(screenshot_dir, coin.name, coin.url, ".png")
-            temporary = screenshot.with_name(screenshot.stem + ".part.png")
-            try:
-                retry(lambda: page.screenshot(path=str(temporary), full_page=True, timeout=90_000))
-                os.replace(temporary, screenshot)
-            finally:
-                temporary.unlink(missing_ok=True)
+            _save_full_page_screenshot(page, screenshot)
             details["screenshot"] = str(screenshot.relative_to(output_root))
+        except AccessWallError:
+            raise
         except Exception as error:
             details["review"].append(f"website_capture_failed:{type(error).__name__}")
 
@@ -513,8 +523,14 @@ def _capture_coin(
             elif result.startswith("not_pdf:"):
                 pending_site = whitepaper
                 details["whitepaper_result"] = "website"
+                _navigate(page, whitepaper)
+                screenshot = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.png")
+                _save_full_page_screenshot(page, screenshot)
+                details["whitepaper_screenshot"] = str(screenshot.relative_to(output_root))
             else:
                 details["review"].append(f"whitepaper_{result}")
+        except AccessWallError:
+            raise
         except Exception as error:
             details["review"].append(f"whitepaper_download_failed:{type(error).__name__}")
     else:

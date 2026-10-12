@@ -14,6 +14,7 @@ from coingecko_archive import (
     retry,
     _recent_sort_key,
     _save_preview,
+    _save_full_page_screenshot,
     _capture_allowed,
     sanitize_filename,
 )
@@ -192,3 +193,17 @@ def test_capture_requires_active_star_unless_explicitly_overridden():
     assert not _capture_allowed(inactive, include_unstarred=False)
     assert not _capture_allowed(unknown, include_unstarred=False)
     assert all(_capture_allowed(coin, include_unstarred=True) for coin in (active, inactive, unknown))
+
+
+def test_full_page_screenshot_saves_atomically_and_cleans_temporary_file(tmp_path):
+    class FakePage:
+        def screenshot(self, *, path, full_page, timeout):
+            assert full_page
+            assert timeout == 90_000
+            Path(path).write_bytes(b"png")
+
+    target = tmp_path / "whitepapers" / "Example-whitepaper.png"
+    _save_full_page_screenshot(FakePage(), target)
+
+    assert target.read_bytes() == b"png"
+    assert not target.with_name(target.stem + ".part" + target.suffix).exists()
