@@ -274,6 +274,10 @@ def is_complete(record: dict) -> bool:
     return record.get("status") == "completed"
 
 
+def _capture_allowed(coin: Coin, include_unstarred: bool) -> bool:
+    return include_unstarred or coin.portfolio == "active"
+
+
 def retry(operation: Callable[[], T], attempts: int = RETRIES, delay: float = 1.0) -> T:
     last_error: Exception | None = None
     for attempt in range(attempts):
@@ -639,7 +643,7 @@ def run(args: argparse.Namespace) -> int:
                 return 0
 
             for coin in all_coins:
-                if coin.portfolio != "active":
+                if not _capture_allowed(coin, args.include_unstarred):
                     if coin.portfolio == "unknown":
                         existing = manifest["coins"].get(coin.url, {})
                         existing.update(
@@ -686,6 +690,11 @@ def main() -> int:
     parser.add_argument("--profile")
     parser.add_argument("--output-dir")
     parser.add_argument("--setup-profile", action="store_true")
+    parser.add_argument(
+        "--include-unstarred",
+        action="store_true",
+        help="Capture all recent coins regardless of login or portfolio-star state.",
+    )
     args = parser.parse_args()
     if not 1 <= args.pages <= 10:
         parser.error("--pages must be between 1 and 10")

@@ -14,6 +14,7 @@ from coingecko_archive import (
     retry,
     _recent_sort_key,
     _save_preview,
+    _capture_allowed,
     sanitize_filename,
 )
 
@@ -180,3 +181,14 @@ def test_completion_and_bounded_retry():
 
     assert retry(flaky, attempts=2, delay=0) == "ok"
     assert attempts == 2
+
+
+def test_capture_requires_active_star_unless_explicitly_overridden():
+    active = Coin("Active", "https://example.com/active", "active", 1)
+    inactive = Coin("Inactive", "https://example.com/inactive", "inactive", 1)
+    unknown = Coin("Unknown", "https://example.com/unknown", "unknown", 1)
+
+    assert _capture_allowed(active, include_unstarred=False)
+    assert not _capture_allowed(inactive, include_unstarred=False)
+    assert not _capture_allowed(unknown, include_unstarred=False)
+    assert all(_capture_allowed(coin, include_unstarred=True) for coin in (active, inactive, unknown))
