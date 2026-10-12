@@ -16,7 +16,7 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt
 ```
 
-Playwright는 설치된 Google Chrome을 사용합니다. 자동화 전용 Chrome 프로필은 기본적으로 `%LOCALAPPDATA%\CoinGeckoArchive\chrome-profile`에 만들어지며, 일반 Chrome 프로필과 분리됩니다. Chrome을 열 수 없으면 Chrome 설치와 해당 계정의 데스크톱 로그인 상태를 확인하세요.
+Playwright는 설치된 **Google Chrome 실행 파일의 경로를 직접 지정**하며, Chrome이 없으면 Edge 등 다른 브라우저로 대신 실행하지 않고 종료합니다. 자동화 전용 Chrome 프로필은 기본적으로 `%LOCALAPPDATA%\CoinGeckoArchive\chrome-profile`에 만들어지며, 일반 Chrome 프로필과 분리됩니다. 일반 Chrome에 이미 로그인되어 있어도 전용 프로필에서 별도로 로그인해야 합니다.
 
 ## 전용 프로필 로그인
 
@@ -27,6 +27,8 @@ python .\coingecko_archive.py --setup-profile
 ```
 
 열린 Chrome 창에서 CoinGecko에 직접 로그인하고 포트폴리오 별표 상태가 표시되는지 확인한 뒤, 터미널로 돌아와 Enter를 누릅니다. 로그인 정보는 이 프로그램이나 저장소에 입력하지 않습니다. 프로필 폴더에는 브라우저 로그인 세션 정보가 포함될 수 있으므로 다른 사람과 공유하거나 백업 저장소에 올리지 마세요.
+
+미리보기/수집 프로그램을 실행하기 전에 `--setup-profile` 명령이 끝나 전용 Chrome 창이 닫혔는지 확인하세요. 해당 프로필이 이미 다른 창에서 사용 중이면 새 실행은 충돌 안내와 함께 중단됩니다. 일반 Chrome/Edge 창은 닫지 않아도 됩니다.
 
 ## 실행
 
@@ -43,6 +45,8 @@ python .\coingecko_archive.py --mode capture --pages 10
 ```
 
 `--pages`는 1부터 10까지만 허용됩니다. 실행 중 접근 확인/CAPTCHA 화면을 만나면 자동으로 우회하지 않고 중단합니다. 별표가 비활성인 코인은 건너뛰고, 별표를 판정할 수 없는 코인은 검토용 기록만 남깁니다. 첫 실행 전에 미리보기를 확인하고, 개인 계정에 로그인한 전용 프로필에서 수동으로 실제 수집을 시작하세요.
+
+일반 Chrome 창에 이미 로그인되어 있어도 프로그램은 그 창에 연결하거나 기존 프로필 쿠키를 읽지 않습니다. 전용 프로필을 선택한 것은 Chrome을 강제 종료하거나 로그인 상태를 복사하지 않기 위한 안전 조치입니다. 따라서 일반 Chrome에서만 로그인한 경우 미리보기 별표 상태는 `unknown`으로 나올 수 있으며, 이 경우 수집하지 않습니다. PowerShell의 코드 페이지에서 표시할 수 없는 코인 문자는 실행이 중단되지 않도록 이스케이프해 출력합니다.
 
 공식 웹사이트의 전체 페이지 스크린샷은 `archive\screenshots`에, 실제 PDF임이 `%PDF-` 파일 시그니처로 확인된 백서는 `archive\whitepapers`에 저장됩니다. PDF가 아닌 백서는 수집 후 전용 Chrome 프로필의 새 창/탭으로 열어 둡니다. 결과 상태와 검토 사유는 `.state\manifest.json`에 기록됩니다. 이 경로들은 `.gitignore`에 포함되어 있습니다. 완료된 코인은 다음 실행에서 건너뛰고, 실패/검토 상태는 다음 실행에서 재시도합니다. 각 코인 처리가 끝날 때마다 매니페스트를 저장합니다.
 

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from coingecko_archive import (
     Coin,
+    _chrome_executable,
     deduplicate_coins,
     extract_labeled_link,
     is_complete,
@@ -11,6 +12,28 @@ from coingecko_archive import (
     retry,
     sanitize_filename,
 )
+
+
+def test_browser_resolution_requires_google_chrome_not_edge(tmp_path, monkeypatch):
+    chrome = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
+    chrome.parent.mkdir(parents=True)
+    chrome.touch()
+    edge_root = tmp_path / "Edge"
+    edge = edge_root / "Application" / "msedge.exe"
+    edge.parent.mkdir(parents=True)
+    edge.touch()
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
+    monkeypatch.setenv("PROGRAMFILES(X86)", str(edge_root))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+
+    assert _chrome_executable() == str(chrome)
+
+
+def test_browser_resolution_fails_closed_when_chrome_missing(tmp_path, monkeypatch):
+    for environment in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        monkeypatch.setenv(environment, str(tmp_path))
+
+    assert _chrome_executable() is None
 
 
 def test_listing_explicit_portfolio_state_and_unknown_fail_closed():

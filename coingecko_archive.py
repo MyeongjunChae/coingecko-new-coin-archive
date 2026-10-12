@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -17,7 +16,13 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup, Tag
-from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import (
+    BrowserContext,
+    Error as PlaywrightError,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 LIST_URL = "https://www.coingecko.com/en/new-cryptocurrencies"
 MAX_PDF_BYTES = 100 * 1024 * 1024
@@ -283,9 +288,6 @@ def _download_pdf(url: str, target: Path) -> tuple[bool, str]:
 
 
 def _chrome_executable() -> str | None:
-    found = shutil.which("chrome")
-    if found:
-        return found
     for environment in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
         root = os.environ.get(environment)
         if root:
@@ -405,6 +407,9 @@ def _run_setup(context: BrowserContext) -> None:
 def run(args: argparse.Namespace) -> int:
     root = Path(__file__).resolve().parent
     profile = Path(args.profile).expanduser().resolve()
+    executable = _chrome_executable()
+    if not executable:
+        raise RuntimeError("Google Chrome was not found; refusing to launch a different browser.")
     manifest_path = root / ".state" / "manifest.json"
     screenshot_dir = root / "archive" / "screenshots"
     pdf_dir = root / "archive" / "whitepapers"
@@ -413,13 +418,21 @@ def run(args: argparse.Namespace) -> int:
     all_coins: list[Coin] = []
 
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile),
-            channel="chrome",
-            headless=False,
-            viewport={"width": 1440, "height": 1000},
-            accept_downloads=False,
-        )
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile),
+                executable_path=executable,
+                headless=False,
+                viewport={"width": 1440, "height": 1000},
+                accept_downloads=False,
+            )
+        except PlaywrightError as error:
+            if "ProcessSingleton" in str(error):
+                raise RuntimeError(
+                    f"The dedicated Chrome profile is already open: {profile}. "
+                    "Close only that automation Chrome window and retry; other Chrome windows are unaffected."
+                ) from error
+            raise
         try:
             if args.setup_profile:
                 _run_setup(context)
@@ -504,6 +517,9 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description="Fail-closed CoinGecko portfolio coin archiver")
     parser.add_argument("--mode", choices=("dry-run", "capture"), default="dry-run")
     parser.add_argument("--pages", type=int, default=10)
