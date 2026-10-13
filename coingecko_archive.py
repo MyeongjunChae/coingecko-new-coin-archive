@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import json
@@ -467,6 +468,54 @@ def _save_full_page_screenshot(page: Page, target: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _load_lazy_content(page: Page) -> None:
+    stable_rounds = 0
+    previous_height = -1
+    for _ in range(60):
+        _check_access_wall(page)
+        height = page.evaluate("document.documentElement.scrollHeight")
+        page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+        page.wait_for_timeout(250)
+        next_height = page.evaluate("document.documentElement.scrollHeight")
+        if next_height == height == previous_height:
+            stable_rounds += 1
+            if stable_rounds >= 3:
+                break
+        else:
+            stable_rounds = 0
+        previous_height = next_height
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(500)
+
+
+def _save_page_as_pdf(page: Page, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.stem + ".part" + target.suffix)
+    try:
+        session = page.context.new_cdp_session(page)
+        try:
+            result = session.send(
+                "Page.printToPDF",
+                {
+                    "printBackground": True,
+                    "preferCSSPageSize": True,
+                    "displayHeaderFooter": False,
+                    "transferMode": "ReturnAsBase64",
+                },
+            )
+        finally:
+            session.detach()
+        data = base64.b64decode(result["data"], validate=True)
+        if not is_pdf_content(data[:8]):
+            raise ValueError("Browser print output is not a PDF.")
+        if len(data) > MAX_PDF_BYTES:
+            raise ValueError(f"PDF exceeds the {MAX_PDF_BYTES // (1024 * 1024)} MB safety limit")
+        temporary.write_bytes(data)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _capture_coin(
     page: Page,
     coin: Coin,
@@ -498,6 +547,15 @@ def _capture_coin(
         whitepaper_url=whitepaper,
         whitepaper_status=whitepaper_status,
     )
+    try:
+        coin_screenshot = output_path(screenshot_dir, coin.name, coin.url, "-coingecko.png")
+        _save_full_page_screenshot(page, coin_screenshot)
+        details["coin_screenshot"] = str(coin_screenshot.relative_to(output_root))
+    except AccessWallError:
+        raise
+    except Exception as error:
+        details["review"].append(f"coin_screenshot_failed:{type(error).__name__}")
+
     if website_status != "ok" or not website:
         details["review"].append(f"website_{website_status}")
     else:
@@ -522,9 +580,14 @@ def _capture_coin(
                 pending_site = whitepaper
                 details["whitepaper_result"] = "website"
                 _navigate(page, whitepaper)
+                _load_lazy_content(page)
                 screenshot = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.png")
                 _save_full_page_screenshot(page, screenshot)
                 details["whitepaper_screenshot"] = str(screenshot.relative_to(output_root))
+                rendered_pdf = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.pdf")
+                _save_page_as_pdf(page, rendered_pdf)
+                details["pdf"] = str(rendered_pdf.relative_to(output_root))
+                details["whitepaper_result"] = "rendered_pdf"
             else:
                 details["review"].append(f"whitepaper_{result}")
         except AccessWallError:
@@ -699,7 +762,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Fail-closed CoinGecko portfolio coin archiver")
     parser.add_argument("--mode", choices=("dry-run", "capture"), default="dry-run")
     parser.add_argument("--pages", type=int, default=10)
-    parser.add_argument("--since-days", type=int, default=7)
+    parser.add_argument("--since-days", type=int, default=1)
     parser.add_argument("--browser", choices=("chrome", "edge"), default="chrome")
     parser.add_argument("--profile")
     parser.add_argument("--output-dir")

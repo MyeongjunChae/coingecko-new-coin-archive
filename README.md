@@ -36,40 +36,40 @@ python .\coingecko_archive.py --browser edge --setup-profile
 
 ## 실행
 
-미리보기는 처음 10페이지에서 CoinGecko가 표시한 등록 경과시간이 7일 이하이며 날짜를 판독할 수 있는 코인 목록을 최근 등록순으로 출력하고 `recent-coins-preview.csv`로 저장합니다. 상대 시간 표시를 기준으로 한 목록이므로 `7 days` 항목도 포함됩니다. 캡처와 다운로드는 하지 않습니다. 기본 실행은 코드 폴더를 출력 위치로 사용하지만, `--output-dir`로 개인 데이터 경로를 지정할 수 있습니다.
+미리보기는 처음 10페이지에서 CoinGecko가 표시한 등록 경과시간이 1일 이하이며 날짜를 판독할 수 있는 코인 목록을 최근 등록순으로 출력하고 `recent-coins-preview.csv`로 저장합니다. 등록 시간은 CoinGecko의 상대 시간 표시 기준입니다. 캡처와 다운로드는 하지 않습니다. `--since-days 7`로 최근 7일 범위도 지정할 수 있습니다. 기본 실행은 코드 폴더를 출력 위치로 사용하지만, `--output-dir`로 개인 데이터 경로를 지정할 수 있습니다.
 
 ```powershell
 $output = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CoinGecko Archive'
-python .\coingecko_archive.py --browser edge --mode dry-run --pages 10 --since-days 7 --output-dir $output
+python .\coingecko_archive.py --browser edge --mode dry-run --pages 10 --since-days 1 --output-dir $output
 ```
 
 실제 수집은 다음 명령으로 실행합니다.
 
 ```powershell
 $output = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CoinGecko Archive'
-python .\coingecko_archive.py --browser edge --mode capture --pages 10 --since-days 7 --output-dir $output
+python .\coingecko_archive.py --browser edge --mode capture --pages 10 --since-days 1 --include-unstarred --output-dir $output
 ```
 
-`--pages`는 1부터 10까지만 허용됩니다. 실행 중 접근 확인/CAPTCHA 화면을 만나면 자동으로 우회하지 않고 중단합니다. 별표가 비활성인 코인은 건너뛰고, 별표를 판정할 수 없는 코인은 검토용 기록만 남깁니다. 첫 실행 전에 미리보기를 확인하고, 개인 계정에 로그인한 전용 프로필에서 수동으로 실제 수집을 시작하세요.
+기본값은 최근 1일이며 `--pages`는 1부터 10까지만 허용됩니다. 실행 중 접근 확인/CAPTCHA 화면을 만나면 자동으로 우회하지 않고 중단합니다.
 
-사용자가 명시적으로 전체 수집을 원할 때는 `--include-unstarred`를 추가할 수 있습니다. 이 옵션은 로그인 및 포트폴리오 별표 상태와 관계없이 최근 기간의 모든 코인을 처리합니다. 기본 설정은 계속해서 별표가 활성인 코인만 캡처합니다.
+`--include-unstarred`는 로그인/별표 상태와 관계없이 지정 기간의 모든 코인을 처리합니다. 이 옵션이 없으면 별표가 명시적으로 활성인 코인만 캡처합니다.
 
 일반 Chrome/Edge 창에 이미 로그인되어 있어도 프로그램은 그 창에 연결하거나 기존 프로필 쿠키를 읽지 않습니다. 전용 프로필을 사용하는 것은 브라우저를 강제 종료하거나 로그인 상태를 복사하지 않기 위한 안전 조치입니다. 따라서 일반 프로필에서만 로그인한 경우 미리보기 별표 상태는 `unknown`으로 나올 수 있으며, 이 경우 수집하지 않습니다. PowerShell의 코드 페이지에서 표시할 수 없는 코인 문자는 실행이 중단되지 않도록 이스케이프해 출력합니다.
 
-공식 웹사이트의 전체 페이지 스크린샷은 출력 폴더의 `archive\screenshots`에, 실제 PDF임이 `%PDF-` 파일 시그니처로 확인된 백서는 `archive\whitepapers`에 저장됩니다. GitBook 등 PDF가 아닌 백서 사이트도 전체 페이지 PNG로 `archive\whitepapers`에 저장하고, 수집 후 선택한 전용 브라우저 프로필의 새 창/탭으로 열어 둡니다. 결과 상태와 검토 사유는 `.state\manifest.json`에 기록됩니다. 기본 프로필/출력 경로는 `.gitignore`에 포함되어 있습니다. 완료된 코인은 다음 실행에서 건너뛰고, 실패/검토 상태는 다음 실행에서 재시도합니다. 각 코인 처리가 끝날 때마다 매니페스트를 저장합니다.
+각 코인의 CoinGecko 상세 페이지 전체 PNG는 `archive\screenshots`에 저장합니다. 명확히 연결된 공식 웹사이트가 있으면 해당 사이트도 전체 PNG로 저장합니다. 백서 링크가 실제 PDF면 원본 PDF를, GitBook 등 웹페이지면 지연 로딩 내용을 읽은 뒤 전체 PNG와 브라우저 인쇄 PDF를 `archive\whitepapers`에 저장합니다. 비-PDF 백서 URL은 선택한 전용 브라우저의 별도 창에도 열어 둡니다. 인쇄 PDF 생성은 사이트의 인쇄용 레이아웃을 사용하므로 페이지마다 결과가 다를 수 있습니다. 결과 상태와 검토 사유는 `.state\manifest.json`에 기록됩니다. 프로필/출력 경로는 `.gitignore`에 포함되어 있습니다. 완료된 코인은 다음 실행에서 건너뛰고, 실패/검토 상태는 다음 실행에서 재시도합니다. 각 코인 처리가 끝날 때마다 매니페스트를 저장합니다.
 
 파일 이름은 Windows에서 사용할 수 없는 문자를 치환하고 코인 URL 해시를 덧붙여 동명 코인도 구별합니다. 다운로드는 순차적으로 수행하고 재시도 횟수와 PDF 크기에 제한을 둡니다.
 
 ## 매일 오후 7시(KST) 예약
 
-매일 최근 7일 목록 CSV만 저장하려면 Windows **작업 스케줄러**에서 다음처럼 작업을 설정합니다. 이 작업은 페이지 목록만 갱신하며 웹사이트 스크린샷이나 PDF를 수집하지 않습니다.
+매일 오후 7시(KST)에 최근 1일 코인을 캡처하려면 Windows **작업 스케줄러**에서 다음처럼 작업을 설정합니다. 실행 때마다 목록 CSV, CoinGecko/공식 사이트 PNG, 백서 PDF 또는 GitBook 인쇄 PDF를 갱신합니다.
 
 1. 작업 만들기에서 트리거를 매일 오후 7시로 지정합니다. Windows 시간대가 한국 표준시인지 확인하세요.
 2. 보안 옵션에서 **사용자가 로그온할 때만 실행**을 선택합니다. 이 작업은 대화형 Edge를 여는 로컬 프로필을 사용합니다.
-3. 동작은 `프로그램 시작`으로 설정합니다. 프로그램은 Python의 전체 경로, 인수는 `coingecko_archive.py --browser edge --mode dry-run --pages 10 --since-days 7 --output-dir "C:\path\to\CoinGecko Archive"`, 시작 위치는 수집기 코드 폴더로 지정합니다.
+3. 동작은 `프로그램 시작`으로 설정합니다. 프로그램은 Python의 전체 경로, 인수는 `coingecko_archive.py --browser edge --mode capture --pages 10 --since-days 1 --include-unstarred --output-dir "C:\path\to\CoinGecko Archive"`, 시작 위치는 수집기 코드 폴더로 지정합니다.
 4. 이미 실행 중인 작업은 **새 인스턴스를 시작하지 않음**으로 설정합니다.
 
-예약 작업은 현재 Windows 사용자가 로그인한 세션에서 실행됩니다. `--mode capture`는 별도 전용 프로필의 수동 로그인과 포트폴리오 별표 상태 확인 후에만 사용하세요. 일반 Edge 로그인은 전용 프로필에 공유되지 않으며, CAPTCHA가 나오면 자동으로 우회하지 말고 중단합니다.
+예약 작업은 현재 Windows 사용자가 로그인한 세션에서 실행됩니다. 이 작업은 별도 브라우저 프로필을 사용하며, 계정 로그인이 없어도 동작합니다. CAPTCHA/접근 제한이 나오면 자동으로 우회하지 않고 중단합니다.
 
 ## 개발 및 테스트
 

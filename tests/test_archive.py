@@ -1,3 +1,4 @@
+import base64
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from coingecko_archive import (
     _recent_sort_key,
     _save_preview,
     _save_full_page_screenshot,
+    _save_page_as_pdf,
     _capture_allowed,
     sanitize_filename,
 )
@@ -206,4 +208,28 @@ def test_full_page_screenshot_saves_atomically_and_cleans_temporary_file(tmp_pat
     _save_full_page_screenshot(FakePage(), target)
 
     assert target.read_bytes() == b"png"
+    assert not target.with_name(target.stem + ".part" + target.suffix).exists()
+
+
+def test_rendered_whitepaper_pdf_is_validated_and_saved_atomically(tmp_path):
+    class FakeSession:
+        def send(self, method, options):
+            assert method == "Page.printToPDF"
+            assert options["printBackground"]
+            return {"data": base64.b64encode(b"%PDF-1.7\n").decode("ascii")}
+
+        def detach(self):
+            pass
+
+    class FakeContext:
+        def new_cdp_session(self, page):
+            return FakeSession()
+
+    class FakePage:
+        context = FakeContext()
+
+    target = tmp_path / "whitepapers" / "GitBook-whitepaper.pdf"
+    _save_page_as_pdf(FakePage(), target)
+
+    assert target.read_bytes() == b"%PDF-1.7\n"
     assert not target.with_name(target.stem + ".part" + target.suffix).exists()
