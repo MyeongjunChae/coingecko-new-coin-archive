@@ -1,13 +1,18 @@
 import base64
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
+import coingecko_archive as archive
 from coingecko_archive import (
     Coin,
     _browser_executable,
     age_within_days,
     deduplicate_coins,
+    extract_coin_website,
+    extract_explorer_links,
     extract_labeled_link,
+    extract_twitter_link,
     is_complete,
     is_pdf_content,
     page_url,
@@ -18,6 +23,8 @@ from coingecko_archive import (
     _save_full_page_screenshot,
     _save_page_as_pdf,
     _capture_allowed,
+    _twitter_account_unavailable,
+    _capture_coin,
     sanitize_filename,
 )
 
@@ -162,6 +169,138 @@ def test_labeled_links_reject_ambiguous_values():
     assert extract_labeled_link(html, {"Website"}, "https://www.coingecko.com/")[1] == "ambiguous"
 
 
+def test_coin_link_rows_select_website_community_twitter_and_explorers():
+    html = """
+    <div class="row">
+      <div>Website</div>
+      <div><a href="https://example.org">example.org</a>
+           <a href="https://example.org/docs">Whitepaper</a></div>
+    </div>
+    <div class="row">
+      <div>Community</div>
+      <div><a href="https://twitter.com/project">Twitter</a></div>
+    </div>
+    <div class="row">
+      <div>Search on Twitter</div>
+      <div><a href="https://twitter.com/search?q=coin">Twitter</a></div>
+    </div>
+    <div class="row">
+      <div>Explorers</div>
+      <div><a href="https://etherscan.io/token/1">Etherscan</a>
+           <a href="https://etherscan.io/token/1#code">Etherscan source</a>
+           <a href="https://blockscout.com/token/1">Blockscout</a></div>
+    </div>
+    """
+
+    assert extract_coin_website(html, "https://www.coingecko.com/en/coins/example") == (
+        "https://example.org",
+        "ok",
+    )
+    assert extract_twitter_link(html, "https://www.coingecko.com/en/coins/example") == (
+        "https://twitter.com/project",
+        "ok",
+    )
+    assert extract_explorer_links(html, "https://www.coingecko.com/en/coins/example") == [
+        "https://blockscout.com/token/1",
+        "https://etherscan.io/token/1#code",
+    ]
+
+
+def test_deleted_twitter_page_is_detected_but_login_wall_is_not_misclassified():
+    class FakePage:
+        def __init__(self, text):
+            self.text = text
+
+        class Locator:
+            def __init__(self, text):
+                self.text = text
+
+            def inner_text(self, timeout):
+                return self.text
+
+        def locator(self, selector):
+            assert selector == "body"
+            return self.Locator(self.text)
+
+    assert _twitter_account_unavailable(FakePage("This account doesn't exist"))
+    assert _twitter_account_unavailable(FakePage("This account has been suspended"))
+    assert not _twitter_account_unavailable(FakePage("Log in to X to see this profile"))
+
+
+def test_capture_uses_community_twitter_when_website_is_missing(tmp_path, monkeypatch):
+    class FakePage:
+        def screenshot(self, *, path, full_page, timeout):
+            Path(path).write_bytes(b"png")
+
+        class Body:
+            def inner_text(self, timeout):
+                return "Public profile"
+
+        def locator(self, selector):
+            assert selector == "body"
+            return self.Body()
+
+    monkeypatch.setattr(
+        archive,
+        "_coin_details",
+        lambda page, coin: (
+            coin.name, None, "missing", None, "missing",
+            "https://twitter.com/example", "ok", ["https://etherscan.io/token/1"],
+        ),
+    )
+    monkeypatch.setattr(archive, "_navigate", lambda page, url: SimpleNamespace(status=200))
+
+    details, pending = _capture_coin(
+        FakePage(), Coin("Example", "https://coingecko.com/en/coins/example", "unknown", 1),
+        tmp_path / "screenshots", tmp_path / "whitepapers", tmp_path,
+    )
+
+    assert details["capture_source"] == "twitter"
+    assert details["twitter_screenshot"].endswith("-twitter.png")
+    assert "screenshot" not in details
+    assert pending is None
+
+
+def test_capture_skips_deleted_twitter_and_uses_explorer(tmp_path, monkeypatch):
+    class FakePage:
+        def screenshot(self, *, path, full_page, timeout):
+            Path(path).write_bytes(b"png")
+
+        class Body:
+            def inner_text(self, timeout):
+                return "This account doesn't exist"
+
+        def locator(self, selector):
+            assert selector == "body"
+            return self.Body()
+
+    visited = []
+    monkeypatch.setattr(
+        archive,
+        "_coin_details",
+        lambda page, coin: (
+            coin.name, None, "missing", None, "missing",
+            "https://twitter.com/deleted", "ok", ["https://etherscan.io/token/1"],
+        ),
+    )
+
+    def navigate(page, url):
+        visited.append(url)
+        return SimpleNamespace(status=404 if "twitter.com" in url else 200)
+
+    monkeypatch.setattr(archive, "_navigate", navigate)
+    details, _ = _capture_coin(
+        FakePage(), Coin("Example", "https://coingecko.com/en/coins/example", "unknown", 1),
+        tmp_path / "screenshots", tmp_path / "whitepapers", tmp_path,
+    )
+
+    assert details["twitter_status"] == "account_unavailable"
+    assert "twitter_screenshot" not in details
+    assert details["capture_source"] == "explorer"
+    assert details["explorer_screenshots"][0].endswith("-explorer.png")
+    assert visited == ["https://twitter.com/deleted", "https://etherscan.io/token/1"]
+
+
 def test_pdf_magic_bytes_and_filename_safety():
     assert is_pdf_content(b"%PDF-1.7\n")
     assert not is_pdf_content(b"<html>not a PDF</html>")
@@ -216,7 +355,8 @@ def test_rendered_whitepaper_pdf_is_validated_and_saved_atomically(tmp_path):
         def send(self, method, options):
             assert method == "Page.printToPDF"
             assert options["printBackground"]
-            return {"data": base64.b64encode(b"%PDF-1.7\n").decode("ascii")}
+            content = b"%PDF-1.7\n1 0 obj << /Type /Page >> endobj\n" + b"x" * 1100 + b"\n%%EOF"
+            return {"data": base64.b64encode(content).decode("ascii")}
 
         def detach(self):
             pass
@@ -231,5 +371,33 @@ def test_rendered_whitepaper_pdf_is_validated_and_saved_atomically(tmp_path):
     target = tmp_path / "whitepapers" / "GitBook-whitepaper.pdf"
     _save_page_as_pdf(FakePage(), target)
 
-    assert target.read_bytes() == b"%PDF-1.7\n"
+    assert target.read_bytes().startswith(b"%PDF-1.7\n")
+    assert b"/Type /Page" in target.read_bytes()
+    assert not target.with_name(target.stem + ".part" + target.suffix).exists()
+
+
+def test_empty_rendered_pdf_is_rejected_and_temporary_file_removed(tmp_path):
+    class FakeSession:
+        def send(self, method, options):
+            return {"data": base64.b64encode(b"%PDF-1.7\n%%EOF").decode("ascii")}
+
+        def detach(self):
+            pass
+
+    class FakeContext:
+        def new_cdp_session(self, page):
+            return FakeSession()
+
+    class FakePage:
+        context = FakeContext()
+
+    target = tmp_path / "empty.pdf"
+    try:
+        _save_page_as_pdf(FakePage(), target)
+    except ValueError as error:
+        assert "empty or incomplete" in str(error)
+    else:
+        raise AssertionError("Empty PDFs must be rejected.")
+
+    assert not target.exists()
     assert not target.with_name(target.stem + ".part" + target.suffix).exists()

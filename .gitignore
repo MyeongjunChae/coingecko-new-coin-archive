@@ -7,4 +7,5 @@ archive/
 chrome-profile/
 edge-profile/
 recent-coins-preview.csv
+capture-report.txt
 *.log

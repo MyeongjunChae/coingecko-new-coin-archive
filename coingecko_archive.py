@@ -23,6 +23,7 @@ from playwright.sync_api import (
     BrowserContext,
     Error as PlaywrightError,
     Page,
+    Response,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
@@ -244,6 +245,136 @@ def extract_labeled_link(html: str, labels: set[str], base_url: str) -> tuple[st
     return None, "missing" if not found else "ambiguous"
 
 
+def _external_url(href: str, base_url: str) -> str | None:
+    value = urljoin(base_url, href)
+    parts = urlsplit(value)
+    if parts.scheme not in {"http", "https"}:
+        return None
+    if (parts.hostname or "").lower().endswith("coingecko.com"):
+        return None
+    return value
+
+
+def _labeled_link_row_targets(html: str, labels: set[str], base_url: str) -> list[tuple[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    normalized_labels = {label.casefold() for label in labels}
+    found: set[tuple[str, str]] = set()
+    for row in soup.find_all(["div", "li", "tr"]):
+        children = row.find_all(recursive=False)
+        if len(children) < 2:
+            continue
+        row_label = " ".join(children[0].get_text(" ", strip=True).split()).casefold()
+        if row_label not in normalized_labels:
+            continue
+        for anchor in children[1].select("a[href]"):
+            href = _external_url(str(anchor["href"]), base_url)
+            if href:
+                text = " ".join(anchor.get_text(" ", strip=True).split()).casefold()
+                found.add((href, text))
+    return sorted(found)
+
+
+def extract_coin_website(html: str, base_url: str) -> tuple[str | None, str]:
+    links = [
+        href
+        for href, text in _labeled_link_row_targets(html, {"website"}, base_url)
+        if text not in {"whitepaper", "white paper"}
+    ]
+    unique = set(links)
+    if len(unique) == 1:
+        return next(iter(unique)), "ok"
+    if len(unique) > 1:
+        return None, "ambiguous"
+    return extract_labeled_link(html, {"website", "official website"}, base_url)
+
+
+def extract_twitter_link(html: str, base_url: str) -> tuple[str | None, str]:
+    community_links = _labeled_link_row_targets(html, {"community"}, base_url)
+    if community_links:
+        candidates = [(href, text) for href, text in community_links if text in {"twitter", "x"}]
+    else:
+        candidates = [
+            (
+                urljoin(base_url, str(anchor["href"])),
+                " ".join(anchor.get_text(" ", strip=True).split()).casefold(),
+            )
+            for anchor in BeautifulSoup(html, "html.parser").select("a[href]")
+            if " ".join(anchor.get_text(" ", strip=True).split()).casefold() in {"twitter", "x"}
+        ]
+    found: set[str] = set()
+    for raw_href, _ in candidates:
+        href = _external_url(raw_href, base_url)
+        if not href:
+            continue
+        host = (urlsplit(href).hostname or "").lower()
+        if host not in {"twitter.com", "www.twitter.com", "x.com", "www.x.com"}:
+            continue
+        path_parts = [part for part in urlsplit(href).path.split("/") if part]
+        if not path_parts or path_parts[0].lower() in {
+            "intent", "share", "search", "home", "explore", "login", "i"
+        }:
+            continue
+        found.add(urlunsplit((urlsplit(href).scheme, urlsplit(href).netloc, f"/{path_parts[0]}", "", "")))
+    if len(found) == 1:
+        return next(iter(found)), "ok"
+    return None, "missing" if not found else "ambiguous"
+
+
+def extract_explorer_links(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    labeled = _labeled_link_row_targets(html, {"explorer", "explorers"}, base_url)
+    if labeled:
+        found: set[str] = set()
+        for href, _ in labeled:
+            parts = urlsplit(href)
+            canonical = urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+            existing = next((item for item in found if item.split("#", 1)[0] == canonical), None)
+            if existing is None or (not urlsplit(existing).fragment and parts.fragment):
+                if existing:
+                    found.remove(existing)
+                found.add(href)
+        return sorted(found)
+    explorer_hosts = (
+        "explorer", "etherscan", "solscan", "basescan", "arbiscan",
+        "polygonscan", "bscscan", "tronscan", "tonviewer", "blockscout",
+        "snowtrace", "ftmscan", "optimistic.etherscan",
+    )
+    for anchor in soup.select("a[href]"):
+        href = _external_url(str(anchor["href"]), base_url)
+        if not href:
+            continue
+        text = " ".join(anchor.get_text(" ", strip=True).split()).casefold()
+        accessible = " ".join(
+            str(anchor.get(attribute, "")) for attribute in ("aria-label", "title")
+        ).strip().casefold()
+        host = (urlsplit(href).hostname or "").casefold()
+        if (
+            "explorer" in text
+            or "explorer" in accessible
+            or any(marker in host for marker in explorer_hosts)
+        ):
+            found.add(href)
+    return sorted(found)
+
+
+def _twitter_account_unavailable(page: Page) -> bool:
+    text = page.locator("body").inner_text(timeout=5000).casefold()
+    normalized = text.replace("’", "'").replace("‘", "'")
+    return any(
+        marker in normalized
+        for marker in (
+            "this account doesn't exist",
+            "this account has been suspended",
+            "account suspended",
+            "account is suspended",
+            "this page doesn't exist",
+            "account not found",
+            "user not found",
+            "this account is unavailable",
+        )
+    )
+
+
 def sanitize_filename(name: str, limit: int = 100) -> str:
     value = unicodedata.normalize("NFC", name)
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
@@ -316,6 +447,32 @@ def _save_manifest(path: Path, manifest: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _save_capture_report(path: Path, results: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    failures = [record for record in results if record.get("review")]
+    lines = [
+        f"CoinGecko capture report — {datetime.now().astimezone().isoformat()}",
+        f"Processed: {len(results)}; with review items: {len(failures)}",
+        "",
+    ]
+    for record in results:
+        name = " ".join(str(record.get("name", "Unknown")).split())
+        lines.append(f"[{record.get('status', 'unknown')}] {name}")
+        for key in ("screenshot", "twitter_screenshot", "whitepaper_screenshot", "pdf"):
+            if record.get(key):
+                lines.append(f"  {key}: {record[key]}")
+        for item in record.get("explorer_screenshots", []):
+            lines.append(f"  explorer_screenshot: {item}")
+        for reason in record.get("review", []):
+            lines.append(f"  REVIEW: {reason}")
+    try:
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _save_preview(path: Path, coins: Iterable[Coin]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -363,10 +520,13 @@ def _is_authenticated(page: Page) -> bool:
     ).count() == 0
 
 
-def _navigate(page: Page, url: str) -> None:
-    retry(lambda: page.goto(url, wait_until="domcontentloaded", timeout=45_000))
+def _navigate(page: Page, url: str) -> Response | None:
+    response = retry(lambda: page.goto(url, wait_until="domcontentloaded", timeout=45_000))
     _check_access_wall(page)
+    if response and response.status in {401, 403, 429}:
+        raise AccessWallError(f"HTTP {response.status} while opening {url}; stopping without bypass.")
     page.wait_for_timeout(1800)
+    return response
 
 
 def _listing_page(page: Page, number: int) -> list[Coin]:
@@ -386,6 +546,10 @@ def _download_pdf(url: str, target: Path) -> tuple[bool, str]:
     temporary = target.with_suffix(target.suffix + ".part")
     try:
         with requests.get(url, stream=True, timeout=(15, 45), allow_redirects=True) as response:
+            if response.status_code in {401, 403, 429}:
+                raise AccessWallError(
+                    f"HTTP {response.status_code} while downloading whitepaper; refusing to retry or bypass."
+                )
             response.raise_for_status()
             if urlsplit(response.url).scheme not in {"http", "https"}:
                 return False, "invalid_redirect"
@@ -444,18 +608,29 @@ def _open_whitepaper_sites(browser: str, profile: Path, urls: list[str]) -> None
     )
 
 
-def _coin_details(page: Page, coin: Coin) -> tuple[str, str | None, str, str | None, str]:
+def _coin_details(
+    page: Page, coin: Coin
+) -> tuple[str, str | None, str, str | None, str, str | None, str, list[str]]:
     _navigate(page, coin.url)
     heading = page.locator("h1").first
     name = heading.inner_text(timeout=3000).strip() if heading.count() else coin.name
     html = page.content()
-    website, website_status = extract_labeled_link(
-        html, {"website", "official website"}, coin.url
-    )
+    website, website_status = extract_coin_website(html, coin.url)
     whitepaper, whitepaper_status = extract_labeled_link(
         html, {"whitepaper", "white paper"}, coin.url
     )
-    return name or coin.name, website, website_status, whitepaper, whitepaper_status
+    twitter, twitter_status = extract_twitter_link(html, coin.url)
+    explorers = extract_explorer_links(html, coin.url)
+    return (
+        name or coin.name,
+        website,
+        website_status,
+        whitepaper,
+        whitepaper_status,
+        twitter,
+        twitter_status,
+        explorers,
+    )
 
 
 def _save_full_page_screenshot(page: Page, target: Path) -> None:
@@ -508,6 +683,10 @@ def _save_page_as_pdf(page: Page, target: Path) -> None:
         data = base64.b64decode(result["data"], validate=True)
         if not is_pdf_content(data[:8]):
             raise ValueError("Browser print output is not a PDF.")
+        if len(data) < 1024 or b"%%EOF" not in data[-2048:]:
+            raise ValueError("Browser print output is empty or incomplete.")
+        if not re.search(rb"/Type\s*/Page\b", data):
+            raise ValueError("Browser print output contains no PDF pages.")
         if len(data) > MAX_PDF_BYTES:
             raise ValueError(f"PDF exceeds the {MAX_PDF_BYTES // (1024 * 1024)} MB safety limit")
         temporary.write_bytes(data)
@@ -534,7 +713,16 @@ def _capture_coin(
     }
     pending_site: str | None = None
     try:
-        name, website, website_status, whitepaper, whitepaper_status = _coin_details(page, coin)
+        (
+            name,
+            website,
+            website_status,
+            whitepaper,
+            whitepaper_status,
+            twitter,
+            twitter_status,
+            explorers,
+        ) = _coin_details(page, coin)
     except AccessWallError:
         raise
     except Exception as error:
@@ -546,28 +734,78 @@ def _capture_coin(
         website_status=website_status,
         whitepaper_url=whitepaper,
         whitepaper_status=whitepaper_status,
+        twitter_url=twitter,
+        twitter_status=twitter_status,
+        explorer_urls=explorers,
     )
-    try:
-        coin_screenshot = output_path(screenshot_dir, coin.name, coin.url, "-coingecko.png")
-        _save_full_page_screenshot(page, coin_screenshot)
-        details["coin_screenshot"] = str(coin_screenshot.relative_to(output_root))
-    except AccessWallError:
-        raise
-    except Exception as error:
-        details["review"].append(f"coin_screenshot_failed:{type(error).__name__}")
-
-    if website_status != "ok" or not website:
-        details["review"].append(f"website_{website_status}")
-    else:
+    captured_target = False
+    if website_status == "ok" and website:
         try:
-            _navigate(page, website)
-            screenshot = output_path(screenshot_dir, coin.name, coin.url, ".png")
-            _save_full_page_screenshot(page, screenshot)
-            details["screenshot"] = str(screenshot.relative_to(output_root))
+            response = _navigate(page, website)
+            if response and response.status >= 400:
+                details["review"].append(f"website_http_{response.status}")
+            else:
+                screenshot = output_path(
+                    screenshot_dir, coin.name, f"{coin.url}|{website}", "-website.png"
+                )
+                _save_full_page_screenshot(page, screenshot)
+                details["screenshot"] = str(screenshot.relative_to(output_root))
+                details["capture_source"] = "website"
+                captured_target = True
         except AccessWallError:
             raise
         except Exception as error:
             details["review"].append(f"website_capture_failed:{type(error).__name__}")
+    else:
+        details["review"].append(f"website_{website_status}")
+
+    if not captured_target and twitter_status == "ok" and twitter:
+        try:
+            response = _navigate(page, twitter)
+            if (response and response.status in {404, 410}) or _twitter_account_unavailable(page):
+                details["twitter_status"] = "account_unavailable"
+                details["review"].append("twitter_account_unavailable")
+            elif response and response.status >= 400:
+                details["twitter_status"] = f"http_{response.status}"
+                details["review"].append(f"twitter_http_{response.status}")
+            else:
+                screenshot = output_path(
+                    screenshot_dir, coin.name, f"{coin.url}|{twitter}", "-twitter.png"
+                )
+                _save_full_page_screenshot(page, screenshot)
+                details["twitter_screenshot"] = str(screenshot.relative_to(output_root))
+                details["capture_source"] = "twitter"
+                captured_target = True
+        except AccessWallError:
+            raise
+        except Exception as error:
+            details["review"].append(f"twitter_capture_failed:{type(error).__name__}")
+    elif not captured_target and twitter_status != "ok":
+        details["review"].append(f"twitter_{twitter_status}")
+
+    if not captured_target:
+        for explorer in explorers:
+            try:
+                response = _navigate(page, explorer)
+                if response and response.status >= 400:
+                    details["review"].append(f"explorer_http_{response.status}")
+                else:
+                    screenshot = output_path(
+                        screenshot_dir, coin.name, f"{coin.url}|{explorer}", "-explorer.png"
+                    )
+                    _save_full_page_screenshot(page, screenshot)
+                    details.setdefault("explorer_screenshots", []).append(
+                        str(screenshot.relative_to(output_root))
+                    )
+                    details["capture_source"] = "explorer"
+                    captured_target = True
+            except AccessWallError:
+                raise
+            except Exception as error:
+                details["review"].append(f"explorer_capture_failed:{type(error).__name__}")
+
+    if not captured_target:
+        details["review"].append("no_website_twitter_or_explorer_captured")
 
     if whitepaper_status == "ok" and whitepaper:
         try:
@@ -578,22 +816,33 @@ def _capture_coin(
                 details["pdf"] = str(target.relative_to(output_root))
             elif result.startswith("not_pdf:"):
                 pending_site = whitepaper
-                details["whitepaper_result"] = "website"
-                _navigate(page, whitepaper)
-                _load_lazy_content(page)
-                screenshot = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.png")
-                _save_full_page_screenshot(page, screenshot)
-                details["whitepaper_screenshot"] = str(screenshot.relative_to(output_root))
-                rendered_pdf = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.pdf")
-                _save_page_as_pdf(page, rendered_pdf)
-                details["pdf"] = str(rendered_pdf.relative_to(output_root))
-                details["whitepaper_result"] = "rendered_pdf"
+                try:
+                    response = _navigate(page, whitepaper)
+                    if response and response.status >= 400:
+                        raise ValueError(f"whitepaper_http_{response.status}")
+                    _load_lazy_content(page)
+                    screenshot = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.png")
+                    _save_full_page_screenshot(page, screenshot)
+                    details["whitepaper_screenshot"] = str(screenshot.relative_to(output_root))
+                    rendered_pdf = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.pdf")
+                    retry(lambda: _save_page_as_pdf(page, rendered_pdf))
+                    details["pdf"] = str(rendered_pdf.relative_to(output_root))
+                    details["whitepaper_result"] = "rendered_pdf"
+                except AccessWallError:
+                    raise
+                except Exception as error:
+                    details["whitepaper_result"] = "render_failed"
+                    details["review"].append(f"whitepaper_pdf_failed:{type(error).__name__}")
+                    print(f"백서 PDF 생성 실패: {coin.name} ({type(error).__name__})")
             else:
                 details["review"].append(f"whitepaper_{result}")
-        except AccessWallError:
-            raise
+        except AccessWallError as error:
+            details["whitepaper_result"] = "access_blocked"
+            details["review"].append(f"whitepaper_pdf_failed:{type(error).__name__}")
+            print(f"백서 PDF 접근 실패: {coin.name} ({error})")
         except Exception as error:
             details["review"].append(f"whitepaper_download_failed:{type(error).__name__}")
+            print(f"백서 다운로드 실패: {coin.name} ({type(error).__name__})")
     else:
         details["review"].append(f"whitepaper_{whitepaper_status}")
 
@@ -633,8 +882,10 @@ def run(args: argparse.Namespace) -> int:
     manifest_path = output_root / ".state" / "manifest.json"
     screenshot_dir = output_root / "archive" / "screenshots"
     pdf_dir = output_root / "archive" / "whitepapers"
+    report_path = output_root / "capture-report.txt"
     manifest = _load_manifest(manifest_path)
     whitepaper_sites: list[str] = []
+    capture_results: list[dict] = []
     all_coins: list[Coin] = []
 
     with sync_playwright() as playwright:
@@ -743,6 +994,8 @@ def run(args: argparse.Namespace) -> int:
                     page, coin, screenshot_dir, pdf_dir, output_root
                 )
                 manifest["coins"][coin.url] = details
+                capture_results.append(details)
+                _save_capture_report(report_path, capture_results)
                 if pending_site:
                     whitepaper_sites.append(pending_site)
                 _save_manifest(manifest_path, manifest)
@@ -753,6 +1006,7 @@ def run(args: argparse.Namespace) -> int:
 
     _open_whitepaper_sites(args.browser, profile, whitepaper_sites)
     print(f"결과 목록: {manifest_path}")
+    print(f"수집 리포트: {report_path}")
     return 0
 
 
