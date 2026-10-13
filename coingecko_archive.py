@@ -712,10 +712,11 @@ def run(args: argparse.Namespace) -> int:
                     f"| {coin.url} | page {coin.page}"
                 )
 
+            preview_path = output_root / "recent-coins-preview.csv"
+            _save_preview(preview_path, all_coins)
+            print(f"당일 코인 목록 CSV 저장: {preview_path}")
+
             if args.mode == "dry-run":
-                preview_path = output_root / "recent-coins-preview.csv"
-                _save_preview(preview_path, all_coins)
-                print(f"미리보기 CSV 저장: {preview_path}")
                 print("미리보기 완료: 파일 다운로드나 캡처는 수행하지 않았습니다.")
                 return 0
 
