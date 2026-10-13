@@ -206,6 +206,17 @@ def test_coin_link_rows_select_website_community_twitter_and_explorers():
     ]
 
 
+def test_explorer_fallback_scans_known_hosts_without_labeled_row():
+    html = """
+    <a href="https://etherscan.io/token/1">Token explorer</a>
+    <a href="https://example.org">Project website</a>
+    """
+
+    assert extract_explorer_links(html, "https://www.coingecko.com/en/coins/example") == [
+        "https://etherscan.io/token/1"
+    ]
+
+
 def test_deleted_twitter_page_is_detected_but_login_wall_is_not_misclassified():
     class FakePage:
         def __init__(self, text):

@@ -323,8 +323,8 @@ def extract_twitter_link(html: str, base_url: str) -> tuple[str | None, str]:
 def extract_explorer_links(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     labeled = _labeled_link_row_targets(html, {"explorer", "explorers"}, base_url)
+    found: set[str] = set()
     if labeled:
-        found: set[str] = set()
         for href, _ in labeled:
             parts = urlsplit(href)
             canonical = urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
