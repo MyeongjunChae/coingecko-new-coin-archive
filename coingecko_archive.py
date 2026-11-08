@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
@@ -41,10 +41,76 @@ class Coin:
     portfolio: str
     page: int
     added: str | None = None
+    symbol: str = ""
+    duplicate_index: int = 1
+
+    @property
+    def slug(self) -> str:
+        return coin_slug(self.url)
+
+    def label(self) -> str:
+        """Human-readable, collision-resistant name for reports and the web UI."""
+        name = " ".join(self.name.split()) or "Unknown"
+        symbol = " ".join(self.symbol.split())
+        if symbol and not symbol_in_name(name, symbol):
+            base = f"{name} ({symbol})"
+        else:
+            base = name
+        if self.duplicate_index > 1:
+            base = f"{base} #{self.duplicate_index}"
+        return f"{base} [{self.slug}]" if self.slug else base
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "symbol": self.symbol,
+            "slug": self.slug,
+            "display_name": self.label(),
+            "coin_url": self.url,
+            "listed_age": self.added,
+            "portfolio_state": self.portfolio,
+            "page": self.page,
+            "duplicate_index": self.duplicate_index,
+        }
 
 
 class AccessWallError(RuntimeError):
     pass
+
+
+def coin_slug(url: str) -> str:
+    """Return the CoinGecko coin slug from a coin URL (or a composite URL)."""
+    base = url.split("|", 1)[0]
+    path = urlsplit(base).path.rstrip("/")
+    return path.rsplit("/", 1)[-1] if path else ""
+
+
+def symbol_in_name(name: str, symbol: str) -> bool:
+    """True when appending the symbol would be redundant.
+
+    "Auren Protocol" contains the letters "AU" but still benefits from
+    "Auren Protocol (AU)"; "WHALE", "BONER.com", and "Bitcoin BTC" do not.
+    """
+    normalized_name = " ".join(name.split()).casefold()
+    normalized_symbol = " ".join(symbol.split()).casefold()
+    if not normalized_symbol:
+        return True
+    if normalized_name == normalized_symbol:
+        return True
+    if f"({normalized_symbol})" in normalized_name:
+        return True
+    return normalized_name.endswith(" " + normalized_symbol)
+
+
+def assign_duplicate_indices(coins: Iterable[Coin]) -> list[Coin]:
+    """Add a visible #2, #3 suffix when name+symbol collide in one result set."""
+    counts: dict[tuple[str, str], int] = {}
+    result: list[Coin] = []
+    for coin in coins:
+        key = (coin.name.casefold().strip(), coin.symbol.casefold().strip())
+        counts[key] = counts.get(key, 0) + 1
+        result.append(replace(coin, duplicate_index=counts[key]))
+    return result
 
 
 def page_url(page_number: int, base_url: str = LIST_URL) -> str:
@@ -145,11 +211,35 @@ def parse_listing_html(html: str, page_number: int, base_url: str = LIST_URL) ->
         canonical = urlunsplit((parts.scheme, parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
         if canonical in seen:
             continue
-        name = " ".join(anchor.get_text(" ", strip=True).split())
-        if not name:
-            name = str(anchor.get("aria-label", "")).strip()
-        if not name:
+        full_name = " ".join(anchor.get_text(" ", strip=True).split())
+        if not full_name:
+            full_name = str(anchor.get("aria-label", "")).strip()
+        if not full_name:
             continue
+
+        # CoinGecko renders "Name SYMBOL" inside the link. The image alt and
+        # the last nested div both carry the symbol; strip the trailing symbol
+        # from the visible text so the CSV does not say "WHALE WHALE".
+        symbol = ""
+        image = anchor.find("img", alt=True)
+        if image:
+            symbol = " ".join(str(image.get("alt", "")).split())
+        if not symbol:
+            leaves = [
+                node
+                for node in anchor.find_all("div")
+                if node.find("div") is None and node.get_text(" ", strip=True)
+            ]
+            if leaves:
+                candidate = " ".join(leaves[-1].get_text(" ", strip=True).split())
+                if candidate.casefold() != full_name.casefold():
+                    symbol = candidate
+        name = full_name
+        if symbol and name.casefold().endswith(symbol.casefold()):
+            trimmed = name[: -len(symbol)].strip()
+            if trimmed:
+                name = trimmed
+
         seen.add(canonical)
         coins.append(
             Coin(
@@ -158,6 +248,7 @@ def parse_listing_html(html: str, page_number: int, base_url: str = LIST_URL) ->
                 _portfolio_state(row),
                 page_number,
                 _row_age(row),
+                symbol,
             )
         )
     return coins
@@ -175,7 +266,7 @@ def deduplicate_coins(coins: Iterable[Coin]) -> list[Coin]:
             conflicting.add(key)
     for key in conflicting:
         coin = unique[key]
-        unique[key] = Coin(coin.name, coin.url, "unknown", coin.page, coin.added)
+        unique[key] = replace(coin, portfolio="unknown")
     return list(unique.values())
 
 
@@ -393,9 +484,22 @@ def coin_key(url: str) -> str:
     return hashlib.sha256(url.rstrip("/").lower().encode("utf-8")).hexdigest()[:10]
 
 
-def output_path(directory: Path, name: str, url: str, suffix: str) -> Path:
+def output_path(
+    directory: Path, name: str, url: str, suffix: str, symbol: str = ""
+) -> Path:
+    """Build a stable, human-readable filename.
+
+    The slug keeps same-named coins visibly distinct; the short URL hash keeps
+    target pages (website/twitter/explorer) for one coin distinct as well.
+    """
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{sanitize_filename(name)}-{coin_key(url)}{suffix}"
+    label = name
+    if symbol and not symbol_in_name(name, symbol):
+        label = f"{name} ({symbol})"
+    slug = sanitize_filename(coin_slug(url), limit=40)
+    label = sanitize_filename(label, limit=60)
+    parts = [part for part in (label, slug, coin_key(url)) if part]
+    return directory / f"{'-'.join(parts)}{suffix}"
 
 
 def is_pdf_content(prefix: bytes) -> bool:
@@ -457,7 +561,9 @@ def _save_capture_report(path: Path, results: list[dict]) -> None:
         "",
     ]
     for record in results:
-        name = " ".join(str(record.get("name", "Unknown")).split())
+        name = " ".join(
+            str(record.get("display_name") or record.get("name", "Unknown")).split()
+        )
         lines.append(f"[{record.get('status', 'unknown')}] {name}")
         for key in ("screenshot", "twitter_screenshot", "whitepaper_screenshot", "pdf"):
             if record.get(key):
@@ -480,17 +586,31 @@ def _save_preview(path: Path, coins: Iterable[Coin]) -> None:
         with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(
                 handle,
-                fieldnames=("name", "coin_url", "listed_age", "portfolio_state", "page"),
+                fieldnames=(
+                    "display_name",
+                    "symbol",
+                    "slug",
+                    "name",
+                    "coin_url",
+                    "listed_age",
+                    "portfolio_state",
+                    "page",
+                    "duplicate_index",
+                ),
             )
             writer.writeheader()
             for coin in coins:
                 writer.writerow(
                     {
+                        "display_name": coin.label(),
+                        "symbol": coin.symbol,
+                        "slug": coin.slug,
                         "name": coin.name,
                         "coin_url": coin.url,
                         "listed_age": coin.added or "",
                         "portfolio_state": coin.portfolio,
                         "page": coin.page,
+                        "duplicate_index": coin.duplicate_index,
                     }
                 )
         os.replace(temporary, path)
@@ -515,9 +635,28 @@ def _check_access_wall(page: Page) -> None:
 
 
 def _is_authenticated(page: Page) -> bool:
-    return page.get_by_text("Login", exact=True).count() == 0 and page.get_by_text(
-        "Sign up", exact=True
-    ).count() == 0
+    """CoinGecko shows a sign-in modal button and "Log in"/"Sign up" text when signed out."""
+    try:
+        if page.locator("button[data-action*='openSignInModal']").first.is_visible(
+            timeout=2000
+        ):
+            return False
+    except PlaywrightError:
+        pass
+    try:
+        body = page.locator("body").inner_text(timeout=5000)
+    except PlaywrightError:
+        return False
+    lines = {line.strip().casefold() for line in body.splitlines() if line.strip()}
+    signed_out_labels = {
+        "log in",
+        "login",
+        "sign up",
+        "create an account",
+        "로그인",
+        "회원가입",
+    }
+    return not (signed_out_labels & lines)
 
 
 def _navigate(page: Page, url: str) -> Response | None:
@@ -538,8 +677,121 @@ def _listing_page(page: Page, number: int) -> list[Coin]:
         _check_access_wall(page)
     coins = parse_listing_html(page.content(), number, url)
     if not _is_authenticated(page):
-        return [Coin(coin.name, coin.url, "unknown", coin.page, coin.added) for coin in coins]
+        return [replace(coin, portfolio="unknown") for coin in coins]
     return coins
+
+
+_FAVORITE_CLICK_JS = r"""
+(url) => {
+  const normalize = (value) => {
+    try { return new URL(value, location.href).pathname.replace(/\/+$/, ''); }
+    catch (error) { return ''; }
+  };
+  const target = normalize(url);
+  const anchor = [...document.querySelectorAll('a[href]')]
+    .find((item) => normalize(item.href) === target);
+  if (!anchor) return {found: false};
+  const row = anchor.closest('tr, [role="row"]');
+  if (!row) return {found: true, row: false, star: false};
+  const star = row.querySelector("i[data-action*='coin-favorites'], [data-action*='coin-favorites']");
+  if (!star) return {found: true, row: true, star: false};
+  const event = (star.getAttribute('data-analytics-event') || '').toLowerCase();
+  const active = event.includes('remove_portfolio')
+    || star.classList.contains('fas')
+    || star.classList.contains('fa-solid');
+  if (active) return {found: true, row: true, star: true, active: true, clicked: false};
+  const clickable = star.closest('button, [role="button"]') || star;
+  clickable.click();
+  return {found: true, row: true, star: true, active: false, clicked: true};
+}
+"""
+
+_FAVORITE_STATE_JS = r"""
+(url) => {
+  const normalize = (value) => {
+    try { return new URL(value, location.href).pathname.replace(/\/+$/, ''); }
+    catch (error) { return ''; }
+  };
+  const target = normalize(url);
+  const anchor = [...document.querySelectorAll('a[href]')]
+    .find((item) => normalize(item.href) === target);
+  if (!anchor) return false;
+  const row = anchor.closest('tr, [role="row"]');
+  if (!row) return false;
+  const star = row.querySelector("i[data-action*='coin-favorites'], [data-action*='coin-favorites']");
+  if (!star) return false;
+  const event = (star.getAttribute('data-analytics-event') || '').toLowerCase();
+  return event.includes('remove_portfolio')
+    || star.classList.contains('fas')
+    || star.classList.contains('fa-solid');
+}
+"""
+
+
+def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
+    """Click CoinGecko's star for the selected coins and verify each change.
+
+    This only works with a signed-in session. It never clicks a star that is
+    already active and it records a review status instead of guessing.
+    """
+    groups: dict[int, list[Coin]] = {}
+    for coin in coins:
+        groups.setdefault(coin.page, []).append(coin)
+
+    results: list[dict] = []
+    for page_number, group in sorted(groups.items()):
+        try:
+            _navigate(page, page_url(page_number))
+            page.wait_for_selector("a[href*='/coins/']", timeout=15_000)
+        except Exception as error:
+            for coin in group:
+                results.append(
+                    {
+                        "coin_url": coin.url,
+                        "display_name": coin.label(),
+                        "symbol": coin.symbol,
+                        "status": f"page_failed:{type(error).__name__}",
+                    }
+                )
+            continue
+
+        authenticated = _is_authenticated(page)
+        for coin in group:
+            record = {
+                "coin_url": coin.url,
+                "display_name": coin.label(),
+                "symbol": coin.symbol,
+            }
+            if not authenticated:
+                record["status"] = "login_required"
+                results.append(record)
+                continue
+            if coin.portfolio == "active":
+                record["status"] = "already_active"
+                results.append(record)
+                continue
+            try:
+                outcome = page.evaluate(_FAVORITE_CLICK_JS, coin.url)
+                if not outcome.get("found"):
+                    record["status"] = "row_not_found"
+                elif not outcome.get("star"):
+                    record["status"] = "star_not_found"
+                elif outcome.get("active"):
+                    record["status"] = "already_active"
+                elif outcome.get("clicked"):
+                    page.wait_for_function(_FAVORITE_STATE_JS, arg=coin.url, timeout=12_000)
+                    record["status"] = "added"
+                else:
+                    record["status"] = "unknown"
+            except PlaywrightTimeoutError:
+                record["status"] = (
+                    "login_required" if not _is_authenticated(page) else "verification_failed"
+                )
+            except Exception as error:
+                record["status"] = f"failed:{type(error).__name__}"
+            results.append(record)
+            page.wait_for_timeout(400)
+    return results
 
 
 def _download_pdf(url: str, target: Path) -> tuple[bool, str]:
@@ -590,6 +842,109 @@ def _browser_executable(browser: str) -> str | None:
             if candidate.exists():
                 return str(candidate)
     return None
+
+
+def browser_user_data_dir(browser: str) -> Path:
+    """Default User Data directory for the selected Chromium browser."""
+    local = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+    if browser == "edge":
+        return local / "Microsoft" / "Edge" / "User Data"
+    return local / "Google" / "Chrome" / "User Data"
+
+
+def read_devtools_active_port(user_data_dir: Path) -> str | None:
+    """Read Chrome's DevToolsActivePort file and return a CDP WebSocket URL.
+
+    Chrome 136+ writes this file when the user explicitly enables
+    "Allow remote debugging for this browser instance" at
+    chrome://inspect/#remote-debugging. The format is:
+        <port>
+        /devtools/browser/<uuid>
+    """
+    path = user_data_dir / "DevToolsActivePort"
+    try:
+        lines = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+    except OSError:
+        return None
+    if len(lines) < 2:
+        return None
+    try:
+        port = int(lines[0])
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    ws_path = lines[1]
+    if not ws_path.startswith("/"):
+        ws_path = "/" + ws_path
+    return f"ws://127.0.0.1:{port}{ws_path}"
+
+
+def chrome_debug_endpoint(browser: str = "chrome", user_data_dir: str | None = None) -> str | None:
+    directory = Path(user_data_dir).expanduser() if user_data_dir else browser_user_data_dir(browser)
+    return read_devtools_active_port(directory)
+
+
+def _open_browser_session(
+    playwright, args: argparse.Namespace
+) -> tuple[object | None, BrowserContext, Page, bool]:
+    """Return (browser, context, page, owns_context).
+
+    ``--attach`` attaches to the user's already-running Chrome through the
+    DevToolsActivePort file. It does not copy cookies or launch a second
+    profile. The caller must close only the page, never the context/browser.
+    """
+    if getattr(args, "attach", False) or getattr(args, "cdp_url", None):
+        endpoint = getattr(args, "cdp_url", None) or chrome_debug_endpoint(
+            args.browser, getattr(args, "chrome_user_data", None)
+        )
+        if not endpoint:
+            raise RuntimeError(
+                "실사용 브라우저의 원격 디버깅이 꺼져 있습니다. "
+                "주소창에 chrome://inspect/#remote-debugging 을 열고 "
+                "'Allow remote debugging for this browser instance'를 켠 뒤 다시 실행하세요."
+            )
+        print("실사용 브라우저에 연결합니다. 브라우저에 승인 창이 뜨면 '허용'을 눌러주세요.")
+        browser = playwright.chromium.connect_over_cdp(endpoint, timeout=90_000)
+        contexts = browser.contexts or [browser.new_context()]
+        # Chrome can expose one context per profile. Prefer the profile that
+        # already has a CoinGecko tab open, then fall back to the first one.
+        context = contexts[0]
+        for candidate in contexts:
+            try:
+                if any("coingecko.com" in (item.url or "") for item in candidate.pages):
+                    context = candidate
+                    break
+            except PlaywrightError:
+                continue
+        page = context.new_page()
+        return browser, context, page, False
+
+    profile = (
+        Path(args.profile).expanduser().resolve()
+        if args.profile
+        else (
+            Path(os.environ.get("LOCALAPPDATA", Path.home()))
+            / "CoinGeckoArchive"
+            / f"{args.browser}-profile"
+        ).resolve()
+    )
+    executable = _browser_executable(args.browser)
+    if not executable:
+        raise RuntimeError(f"{args.browser} was not found; refusing to launch a different browser.")
+    context = playwright.chromium.launch_persistent_context(
+        user_data_dir=str(profile),
+        executable_path=executable,
+        headless=False,
+        viewport={"width": 1440, "height": 1000},
+        accept_downloads=False,
+    )
+    page = context.pages[0] if context.pages else context.new_page()
+    return None, context, page, True
 
 
 def _open_whitepaper_sites(browser: str, profile: Path, urls: list[str]) -> None:
@@ -704,6 +1059,10 @@ def _capture_coin(
 ) -> tuple[dict, str | None]:
     details: dict = {
         "name": coin.name,
+        "symbol": coin.symbol,
+        "slug": coin.slug,
+        "display_name": coin.label(),
+        "duplicate_index": coin.duplicate_index,
         "coin_url": coin.url,
         "portfolio": coin.portfolio,
         "page": coin.page,
@@ -729,7 +1088,7 @@ def _capture_coin(
         details.update(status="needs_review", review=[f"coin_detail_failed:{type(error).__name__}"])
         return details, pending_site
     details.update(
-        name=name,
+        page_name=" ".join(name.split()) if name else None,
         website_url=website,
         website_status=website_status,
         whitepaper_url=whitepaper,
@@ -746,7 +1105,11 @@ def _capture_coin(
                 details["review"].append(f"website_http_{response.status}")
             else:
                 screenshot = output_path(
-                    screenshot_dir, coin.name, f"{coin.url}|{website}", "-website.png"
+                    screenshot_dir,
+                    coin.name,
+                    f"{coin.url}|{website}",
+                    "-website.png",
+                    coin.symbol,
                 )
                 _save_full_page_screenshot(page, screenshot)
                 details["screenshot"] = str(screenshot.relative_to(output_root))
@@ -770,7 +1133,11 @@ def _capture_coin(
                 details["review"].append(f"twitter_http_{response.status}")
             else:
                 screenshot = output_path(
-                    screenshot_dir, coin.name, f"{coin.url}|{twitter}", "-twitter.png"
+                    screenshot_dir,
+                    coin.name,
+                    f"{coin.url}|{twitter}",
+                    "-twitter.png",
+                    coin.symbol,
                 )
                 _save_full_page_screenshot(page, screenshot)
                 details["twitter_screenshot"] = str(screenshot.relative_to(output_root))
@@ -791,7 +1158,11 @@ def _capture_coin(
                     details["review"].append(f"explorer_http_{response.status}")
                 else:
                     screenshot = output_path(
-                        screenshot_dir, coin.name, f"{coin.url}|{explorer}", "-explorer.png"
+                        screenshot_dir,
+                        coin.name,
+                        f"{coin.url}|{explorer}",
+                        "-explorer.png",
+                        coin.symbol,
                     )
                     _save_full_page_screenshot(page, screenshot)
                     details.setdefault("explorer_screenshots", []).append(
@@ -809,7 +1180,7 @@ def _capture_coin(
 
     if whitepaper_status == "ok" and whitepaper:
         try:
-            target = output_path(pdf_dir, coin.name, coin.url, ".pdf")
+            target = output_path(pdf_dir, coin.name, coin.url, ".pdf", coin.symbol)
             ok, result = retry(lambda: _download_pdf(whitepaper, target))
             details["whitepaper_result"] = result
             if ok:
@@ -821,10 +1192,14 @@ def _capture_coin(
                     if response and response.status >= 400:
                         raise ValueError(f"whitepaper_http_{response.status}")
                     _load_lazy_content(page)
-                    screenshot = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.png")
+                    screenshot = output_path(
+                        pdf_dir, coin.name, coin.url, "-whitepaper.png", coin.symbol
+                    )
                     _save_full_page_screenshot(page, screenshot)
                     details["whitepaper_screenshot"] = str(screenshot.relative_to(output_root))
-                    rendered_pdf = output_path(pdf_dir, coin.name, coin.url, "-whitepaper.pdf")
+                    rendered_pdf = output_path(
+                        pdf_dir, coin.name, coin.url, "-whitepaper.pdf", coin.symbol
+                    )
                     retry(lambda: _save_page_as_pdf(page, rendered_pdf))
                     details["pdf"] = str(rendered_pdf.relative_to(output_root))
                     details["whitepaper_result"] = "rendered_pdf"
@@ -864,6 +1239,32 @@ def _open_setup_profile(executable: str, profile: Path) -> None:
     )
 
 
+def _load_selection(path: str | None) -> set[str] | None:
+    if not path:
+        return None
+    data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = data.get("urls") or data.get("coins") or []
+    selected: set[str] = set()
+    for item in data:
+        value = item.get("coin_url") or item.get("url") if isinstance(item, dict) else item
+        if value:
+            selected.add(str(value).rstrip("/").lower())
+    return selected
+
+
+def _write_result_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def run(args: argparse.Namespace) -> int:
     root = Path(__file__).resolve().parent
     default_profile = (
@@ -872,31 +1273,52 @@ def run(args: argparse.Namespace) -> int:
         / f"{args.browser}-profile"
     )
     profile = Path(args.profile).expanduser().resolve() if args.profile else default_profile.resolve()
-    executable = _browser_executable(args.browser)
-    if not executable:
-        raise RuntimeError(f"{args.browser} was not found; refusing to launch a different browser.")
-    if args.setup_profile:
-        _open_setup_profile(executable, profile)
-        return 0
     output_root = Path(args.output_dir).expanduser().resolve() if args.output_dir else root
     manifest_path = output_root / ".state" / "manifest.json"
     screenshot_dir = output_root / "archive" / "screenshots"
     pdf_dir = output_root / "archive" / "whitepapers"
     report_path = output_root / "capture-report.txt"
+    preview_path = output_root / "recent-coins-preview.csv"
+
+    if args.setup_profile:
+        executable = _browser_executable(args.browser)
+        if not executable:
+            raise RuntimeError(f"{args.browser} was not found; refusing to launch a different browser.")
+        _open_setup_profile(executable, profile)
+        return 0
+
     manifest = _load_manifest(manifest_path)
     whitepaper_sites: list[str] = []
     capture_results: list[dict] = []
+    favorite_results: list[dict] = []
     all_coins: list[Coin] = []
+    selected_urls: set[str] | None = _load_selection(args.selection_json)
+    missing_selection: list[str] = []
+    attached = bool(args.attach or args.cdp_url)
+    result: dict = {
+        "version": 1,
+        "mode": args.mode,
+        "started_at": datetime.now().astimezone().isoformat(),
+        "finished_at": None,
+        "browser": {
+            "mode": "attach" if attached else "profile",
+            "browser": args.browser,
+            "endpoint": args.cdp_url
+            or (chrome_debug_endpoint(args.browser, args.chrome_user_data) if attached else None),
+            "profile": None if attached else str(profile),
+        },
+        "pages": args.pages,
+        "since_days": args.since_days,
+        "coins": [],
+        "selected_urls": sorted(selected_urls) if selected_urls is not None else None,
+        "captures": [],
+        "favorites": [],
+        "errors": [],
+    }
 
     with sync_playwright() as playwright:
         try:
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile),
-                executable_path=executable,
-                headless=False,
-                viewport={"width": 1440, "height": 1000},
-                accept_downloads=False,
-            )
+            browser, context, page, owns_context = _open_browser_session(playwright, args)
         except PlaywrightError as error:
             if "ProcessSingleton" in str(error):
                 raise RuntimeError(
@@ -905,7 +1327,6 @@ def run(args: argparse.Namespace) -> int:
                 ) from error
             raise
         try:
-            page = context.pages[0] if context.pages else context.new_page()
             for number in range(1, args.pages + 1):
                 try:
                     coins = retry(lambda: _listing_page(page, number))
@@ -913,6 +1334,9 @@ def run(args: argparse.Namespace) -> int:
                     raise
                 except Exception as error:
                     print(f"페이지 {number}: 읽기 실패 ({type(error).__name__}); 다음 실행에서 재시도합니다.")
+                    result["errors"].append(
+                        {"page": number, "error": type(error).__name__}
+                    )
                     manifest["pages"] = [
                         entry for entry in manifest["pages"] if entry.get("page") != number
                     ]
@@ -922,7 +1346,7 @@ def run(args: argparse.Namespace) -> int:
                 if coins and all(coin.portfolio == "unknown" for coin in coins):
                     print(
                         "로그인되지 않았거나 포트폴리오 별표 상태를 확인할 수 없습니다. "
-                        "이번 실행은 미리보기만 가능하며 캡처는 진행하지 않습니다."
+                        "실사용 Chrome 연결 또는 전용 프로필 로그인을 확인하세요."
                     )
                 all_coins.extend(coins)
                 print(f"페이지 {number}: {len(coins)}개 항목")
@@ -938,6 +1362,8 @@ def run(args: argparse.Namespace) -> int:
                             coin.url,
                             {
                                 "name": coin.name,
+                                "symbol": coin.symbol,
+                                "display_name": coin.label(),
                                 "coin_url": coin.url,
                                 "portfolio": coin.portfolio,
                                 "page": coin.page,
@@ -952,6 +1378,7 @@ def run(args: argparse.Namespace) -> int:
                 (coin for coin in all_coins if age_within_days(coin.added, args.since_days)),
                 key=_recent_sort_key,
             )
+            all_coins = assign_duplicate_indices(all_coins)
             print(
                 f"최근 {args.since_days}일 날짜 판독 가능 항목: "
                 f"{len(all_coins)}개 / {before_filter}개"
@@ -959,52 +1386,109 @@ def run(args: argparse.Namespace) -> int:
             print(f"중복 제거 후 총 {len(all_coins)}개 코인")
             for coin in all_coins:
                 print(
-                    f"- [{coin.portfolio}] {coin.name} | {coin.added or '날짜 미확인'} "
+                    f"- [{coin.portfolio}] {coin.label()} | {coin.added or '날짜 미확인'} "
                     f"| {coin.url} | page {coin.page}"
                 )
 
-            preview_path = output_root / "recent-coins-preview.csv"
             _save_preview(preview_path, all_coins)
             print(f"당일 코인 목록 CSV 저장: {preview_path}")
+            result["coins"] = [coin.as_dict() for coin in all_coins]
+
+            selected = all_coins
+            if selected_urls is not None:
+                selected = [
+                    coin
+                    for coin in all_coins
+                    if coin.url.rstrip("/").lower() in selected_urls
+                ]
+                found = {coin.url.rstrip("/").lower() for coin in selected}
+                missing_selection = sorted(selected_urls - found)
+                if missing_selection:
+                    print(f"선택한 URL 중 현재 목록에 없는 항목: {len(missing_selection)}개")
+                result["missing_selection"] = missing_selection
 
             if args.mode == "dry-run":
                 print("미리보기 완료: 파일 다운로드나 캡처는 수행하지 않았습니다.")
-                return 0
-
-            for coin in all_coins:
-                if not _capture_allowed(coin, args.include_unstarred):
-                    if coin.portfolio == "unknown":
-                        existing = manifest["coins"].get(coin.url, {})
-                        existing.update(
-                            name=coin.name,
-                            coin_url=coin.url,
-                            portfolio="unknown",
-                            status="needs_review",
-                        )
-                        review = existing.setdefault("review", [])
-                        if "portfolio_state_unknown_fail_closed" not in review:
-                            review.append("portfolio_state_unknown_fail_closed")
-                        manifest["coins"][coin.url] = existing
-                    continue
-                existing = manifest["coins"].get(coin.url, {})
-                if is_complete(existing):
-                    print(f"건너뜀(완료됨): {coin.name}")
-                    continue
-                details, pending_site = _capture_coin(
-                    page, coin, screenshot_dir, pdf_dir, output_root
-                )
-                manifest["coins"][coin.url] = details
-                capture_results.append(details)
-                _save_capture_report(report_path, capture_results)
-                if pending_site:
-                    whitepaper_sites.append(pending_site)
+            elif args.mode == "favorites":
+                if not _is_authenticated(page):
+                    raise RuntimeError(
+                        "즐겨찾기를 변경하려면 CoinGecko에 로그인된 실사용 Chrome 세션이 필요합니다."
+                    )
+                favorite_results = add_coins_to_favorites(page, selected)
+                result["favorites"] = favorite_results
+                for item in favorite_results:
+                    existing = manifest["coins"].get(item["coin_url"], {})
+                    existing.update(
+                        name=item.get("display_name") or item["coin_url"],
+                        display_name=item.get("display_name"),
+                        symbol=item.get("symbol"),
+                        coin_url=item["coin_url"],
+                        favorite_status=item["status"],
+                    )
+                    if item["status"] in {"added", "already_active"}:
+                        existing["portfolio"] = "active"
+                    manifest["coins"][item["coin_url"]] = existing
                 _save_manifest(manifest_path, manifest)
-                print(f"{details['status']}: {coin.name}")
-                page.wait_for_timeout(1500)
+                added = sum(1 for item in favorite_results if item["status"] == "added")
+                print(f"즐겨찾기 추가: {added}개 / 처리 {len(favorite_results)}개")
+            else:
+                for coin in selected:
+                    if not _capture_allowed(coin, args.include_unstarred):
+                        if coin.portfolio == "unknown":
+                            existing = manifest["coins"].get(coin.url, {})
+                            existing.update(
+                                name=coin.name,
+                                symbol=coin.symbol,
+                                display_name=coin.label(),
+                                coin_url=coin.url,
+                                portfolio="unknown",
+                                status="needs_review",
+                            )
+                            review = existing.setdefault("review", [])
+                            if "portfolio_state_unknown_fail_closed" not in review:
+                                review.append("portfolio_state_unknown_fail_closed")
+                            manifest["coins"][coin.url] = existing
+                        continue
+                    existing = manifest["coins"].get(coin.url, {})
+                    if is_complete(existing) and not args.force:
+                        print(f"건너뜀(완료됨): {coin.label()}")
+                        continue
+                    details, pending_site = _capture_coin(
+                        page, coin, screenshot_dir, pdf_dir, output_root
+                    )
+                    manifest["coins"][coin.url] = details
+                    capture_results.append(details)
+                    result["captures"] = capture_results
+                    _save_capture_report(report_path, capture_results)
+                    if pending_site:
+                        whitepaper_sites.append(pending_site)
+                    _save_manifest(manifest_path, manifest)
+                    print(f"{details['status']}: {coin.label()}")
+                    page.wait_for_timeout(1500)
         finally:
-            context.close()
+            if owns_context:
+                context.close()
+            else:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
-    _open_whitepaper_sites(args.browser, profile, whitepaper_sites)
+    if whitepaper_sites and owns_context:
+        _open_whitepaper_sites(args.browser, profile, whitepaper_sites)
+    elif whitepaper_sites:
+        print("검토용 백서 사이트(실사용 Chrome 탭을 건드리지 않기 위해 자동으로 열지 않음):")
+        for site in whitepaper_sites:
+            print(f"- {site}")
+
+    result["finished_at"] = datetime.now().astimezone().isoformat()
+    result["paths"] = {
+        "preview": str(preview_path.relative_to(output_root)),
+        "report": str(report_path.relative_to(output_root)),
+        "manifest": str(manifest_path.relative_to(output_root)),
+    }
+    if args.result_json:
+        _write_result_json(Path(args.result_json).expanduser().resolve(), result)
     print(f"결과 목록: {manifest_path}")
     print(f"수집 리포트: {report_path}")
     return 0
@@ -1015,13 +1499,36 @@ def main() -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description="Fail-closed CoinGecko portfolio coin archiver")
-    parser.add_argument("--mode", choices=("dry-run", "capture"), default="dry-run")
+    parser.add_argument("--mode", choices=("dry-run", "capture", "favorites"), default="dry-run")
     parser.add_argument("--pages", type=int, default=10)
     parser.add_argument("--since-days", type=int, default=1)
     parser.add_argument("--browser", choices=("chrome", "edge"), default="chrome")
     parser.add_argument("--profile")
     parser.add_argument("--output-dir")
     parser.add_argument("--setup-profile", action="store_true")
+    parser.add_argument(
+        "--attach",
+        action="store_true",
+        help="Attach to the running browser through chrome://inspect remote debugging.",
+    )
+    parser.add_argument("--cdp-url", help="Explicit CDP WebSocket URL for --attach.")
+    parser.add_argument(
+        "--chrome-user-data",
+        help="Browser User Data directory used to find DevToolsActivePort.",
+    )
+    parser.add_argument(
+        "--selection-json",
+        help="Only process coin URLs listed in this JSON file (string list or {coin_url}).",
+    )
+    parser.add_argument(
+        "--result-json",
+        help="Write a machine-readable run result (coins, captures, favorites).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-capture coins whose manifest status is already completed.",
+    )
     parser.add_argument(
         "--include-unstarred",
         action="store_true",
@@ -1032,6 +1539,8 @@ def main() -> int:
         parser.error("--pages must be between 1 and 10")
     if not 1 <= args.since_days <= 30:
         parser.error("--since-days must be between 1 and 30")
+    if args.selection_json and not Path(args.selection_json).expanduser().exists():
+        parser.error("--selection-json file does not exist")
     try:
         return run(args)
     except AccessWallError as error:

@@ -7,7 +7,9 @@ import coingecko_archive as archive
 from coingecko_archive import (
     Coin,
     _browser_executable,
+    _load_selection,
     age_within_days,
+    assign_duplicate_indices,
     deduplicate_coins,
     extract_coin_website,
     extract_explorer_links,
@@ -15,14 +17,17 @@ from coingecko_archive import (
     extract_twitter_link,
     is_complete,
     is_pdf_content,
+    output_path,
     page_url,
     parse_listing_html,
+    read_devtools_active_port,
     retry,
     _recent_sort_key,
     _save_preview,
     _save_full_page_screenshot,
     _save_page_as_pdf,
     _capture_allowed,
+    _is_authenticated,
     _twitter_account_unavailable,
     _capture_coin,
     sanitize_filename,
@@ -385,6 +390,138 @@ def test_rendered_whitepaper_pdf_is_validated_and_saved_atomically(tmp_path):
     assert target.read_bytes().startswith(b"%PDF-1.7\n")
     assert b"/Type /Page" in target.read_bytes()
     assert not target.with_name(target.stem + ".part" + target.suffix).exists()
+
+
+def test_listing_extracts_symbol_and_cleans_duplicated_visible_name():
+    html = """
+    <table><tbody>
+      <tr><td><i class="far fa-star" data-action="click->coin-favorites#handleCoinFavourites"
+          data-analytics-event="select_add_portfolio_coin_cta"></i></td>
+          <td><a href="/en/coins/whale-4"><img alt="WHALE">
+            <div><div>WHALE<div>WHALE</div></div></div></a></td>
+          <td>about 5 hours</td></tr>
+      <tr><td><i class="far fa-star" data-action="click->coin-favorites#handleCoinFavourites"
+          data-analytics-event="select_add_portfolio_coin_cta"></i></td>
+          <td><a href="/en/coins/auren-protocol"><img alt="AU">
+            <div><div>Auren Protocol<div>AU</div></div></div></a></td>
+          <td>about 7 hours</td></tr>
+    </tbody></table>
+    """
+    coins = parse_listing_html(html, 1)
+    assert [(coin.name, coin.symbol, coin.label()) for coin in coins] == [
+        ("WHALE", "WHALE", "WHALE [whale-4]"),
+        ("Auren Protocol", "AU", "Auren Protocol (AU) [auren-protocol]"),
+    ]
+
+
+class _FakeVisibleLocator:
+    def __init__(self, visible):
+        self.visible = visible
+
+    @property
+    def first(self):
+        return self
+
+    def is_visible(self, timeout=None):
+        return self.visible
+
+
+class _FakeBodyLocator:
+    def __init__(self, text):
+        self.text = text
+
+    def inner_text(self, timeout=None):
+        return self.text
+
+
+class _FakeAuthPage:
+    def __init__(self, sign_in_visible, body_text):
+        self.sign_in_visible = sign_in_visible
+        self.body_text = body_text
+
+    def locator(self, selector):
+        if selector.startswith("button["):
+            return _FakeVisibleLocator(self.sign_in_visible)
+        return _FakeBodyLocator(self.body_text)
+
+
+def test_authentication_detection_uses_sign_in_modal_and_labels():
+    assert _is_authenticated(_FakeAuthPage(True, "Portfolio")) is False
+    assert _is_authenticated(_FakeAuthPage(False, "Home\nLog in")) is False
+    assert _is_authenticated(_FakeAuthPage(False, "Home\nCreate an account")) is False
+    assert _is_authenticated(_FakeAuthPage(False, "Home\nPortfolio\nCoins")) is True
+
+
+def test_listing_fallback_keeps_symbol_when_signed_out(monkeypatch):
+    coin = Coin(
+        "Auren Protocol",
+        "https://www.coingecko.com/en/coins/auren-protocol",
+        "active",
+        1,
+        "about 1 hour",
+        "AU",
+    )
+    monkeypatch.setattr(archive, "_navigate", lambda page, url: None)
+    monkeypatch.setattr(archive, "parse_listing_html", lambda html, number, url: [coin])
+    monkeypatch.setattr(archive, "_is_authenticated", lambda page: False)
+    page = SimpleNamespace(
+        wait_for_selector=lambda *args, **kwargs: None,
+        content=lambda: "<html></html>",
+    )
+    result = archive._listing_page(page, 1)
+    assert result[0].symbol == "AU"
+    assert result[0].portfolio == "unknown"
+    assert result[0].label() == "Auren Protocol (AU) [auren-protocol]"
+
+
+def test_duplicate_name_and_symbol_get_visible_numbered_suffix():
+    coins = [
+        Coin("Example", "https://www.coingecko.com/en/coins/example", "unknown", 1, "1 hour", "EX"),
+        Coin("Example", "https://www.coingecko.com/en/coins/example-2", "unknown", 1, "2 hours", "EX"),
+    ]
+    labeled = assign_duplicate_indices(coins)
+    assert [coin.label() for coin in labeled] == [
+        "Example (EX) [example]",
+        "Example (EX) #2 [example-2]",
+    ]
+    assert labeled[0].as_dict()["duplicate_index"] == 1
+    assert labeled[1].as_dict()["duplicate_index"] == 2
+
+
+def test_output_path_contains_symbol_and_slug_separator(tmp_path):
+    target = output_path(
+        tmp_path,
+        "Whale Coin",
+        "https://www.coingecko.com/en/coins/whale-4|https://example.org",
+        "-website.png",
+        "WHALE",
+    )
+    assert "Whale Coin (WHALE)" in target.name
+    assert "whale-4" in target.name
+    assert target.name.endswith("-website.png")
+
+
+def test_devtools_active_port_parser_and_missing_file(tmp_path):
+    assert read_devtools_active_port(tmp_path) is None
+    path = tmp_path / "DevToolsActivePort"
+    path.write_text("45678\n/devtools/browser/abc-def\n", encoding="utf-8")
+    assert read_devtools_active_port(tmp_path) == "ws://127.0.0.1:45678/devtools/browser/abc-def"
+    path.write_text("not-a-port\n/devtools/browser/abc\n", encoding="utf-8")
+    assert read_devtools_active_port(tmp_path) is None
+
+
+def test_selection_json_accepts_strings_or_coin_objects(tmp_path):
+    path = tmp_path / "selection.json"
+    path.write_text(
+        '{"urls": ["https://www.coingecko.com/en/coins/a", '
+        '{"coin_url": "https://www.coingecko.com/en/coins/b/"}]}',
+        encoding="utf-8",
+    )
+    assert _load_selection(str(path)) == {
+        "https://www.coingecko.com/en/coins/a",
+        "https://www.coingecko.com/en/coins/b",
+    }
+    assert _load_selection(None) is None
 
 
 def test_empty_rendered_pdf_is_rejected_and_temporary_file_removed(tmp_path):
