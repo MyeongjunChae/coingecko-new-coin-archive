@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -31,6 +32,8 @@ from playwright.sync_api import (
 LIST_URL = "https://www.coingecko.com/en/new-cryptocurrencies"
 MAX_PDF_BYTES = 100 * 1024 * 1024
 RETRIES = 3
+PORTFOLIO_FOLDER_START = 16
+PORTFOLIO_FOLDER_SIZE = 1000
 T = TypeVar("T")
 
 
@@ -102,6 +105,31 @@ def symbol_in_name(name: str, symbol: str) -> bool:
     return normalized_name.endswith(" " + normalized_symbol)
 
 
+def is_tokenized_stock_name(name: str, symbol: str = "") -> bool:
+    """CoinGecko tokenized stock entries often open an extra folder-picker step.
+
+    Those entries should be added directly without the extra confirmation flow,
+    while still continuing on to the next coin in the batch.
+    """
+    text = " ".join((name, symbol)).casefold()
+    return "tokenized" in text and ("stock" in text or "share" in text or "token" in text)
+
+
+def portfolio_folder_number(
+    index: int,
+    per_folder_limit: int = PORTFOLIO_FOLDER_SIZE,
+    start_folder: int = PORTFOLIO_FOLDER_START,
+) -> int:
+    """Return the active portfolio folder for a bulk favorites run.
+
+    When the newest existing folder is 16, the next additions should start from 16
+    and then roll to 17 once that folder reaches its capacity.
+    """
+    if index <= 0:
+        return max(1, start_folder)
+    return start_folder + ((index - 1) // per_folder_limit)
+
+
 def assign_duplicate_indices(coins: Iterable[Coin]) -> list[Coin]:
     """Add a visible #2, #3 suffix when name+symbol collide in one result set."""
     counts: dict[tuple[str, str], int] = {}
@@ -123,9 +151,20 @@ def page_url(page_number: int, base_url: str = LIST_URL) -> str:
 def _control_identity(control: Tag) -> bool:
     labels = " ".join(
         str(control.get(attribute, ""))
-        for attribute in ("aria-label", "title", "data-testid", "class")
+        for attribute in ("aria-label", "title", "data-testid", "class", "data-action")
     ).lower()
-    return any(word in labels for word in ("star", "favorite", "favourite", "watchlist", "portfolio"))
+    return any(
+        word in labels
+        for word in (
+            "star",
+            "favorite",
+            "favourite",
+            "watchlist",
+            "portfolio",
+            "coin-favorites",
+            "bookmark",
+        )
+    )
 
 
 def _control_state(control: Tag) -> str:
@@ -137,11 +176,20 @@ def _control_state(control: Tag) -> str:
 
     label = " ".join(
         str(control.get(attribute, ""))
-        for attribute in ("aria-label", "title", "data-testid")
+        for attribute in ("aria-label", "title", "data-testid", "data-action")
     ).strip().lower()
-    if re.search(r"\b(remove|unfollow|unfavorite|un-favorite|unstar|un-star)\b", label):
+    if re.search(
+        r"\b(remove|unfollow|unfavorite|un-favorite|unstar|un-star|remove from portfolio|delete from portfolio)\b",
+        label,
+    ):
         values.append("active")
-    elif re.search(r"\b(add|follow)\b", label):
+    elif re.search(r"\b(add|follow|add to portfolio|favorite|watchlist)\b", label):
+        values.append("inactive")
+
+    classes = {str(item).lower() for item in control.get("class", [])}
+    if "fas" in classes or "fa-solid" in classes or "active" in classes:
+        values.append("active")
+    if "far" in classes or "fa-regular" in classes or "inactive" in classes:
         values.append("inactive")
 
     active_values = {"true", "checked", "selected", "on", "active", "1"}
@@ -151,7 +199,13 @@ def _control_state(control: Tag) -> str:
         for value in values
         if value in active_values or value in inactive_values
     }
-    return states.pop() if len(states) == 1 else "unknown"
+    if len(states) == 1:
+        return next(iter(states))
+    if "active" in values and "inactive" not in values:
+        return "active"
+    if "inactive" in values and "active" not in values:
+        return "inactive"
+    return "unknown"
 
 
 def _listing_row(anchor: Tag) -> Tag | None:
@@ -485,17 +539,26 @@ def coin_key(url: str) -> str:
 
 
 def output_path(
-    directory: Path, name: str, url: str, suffix: str, symbol: str = ""
+    directory: Path,
+    name: str,
+    url: str,
+    suffix: str,
+    symbol: str = "",
+    duplicate_index: int = 1,
 ) -> Path:
     """Build a stable, human-readable filename.
 
     The slug keeps same-named coins visibly distinct; the short URL hash keeps
     target pages (website/twitter/explorer) for one coin distinct as well.
+    Duplicate entries get a human-visible #N suffix so downloaded files stay
+    easy to distinguish when names collide.
     """
     directory.mkdir(parents=True, exist_ok=True)
     label = name
     if symbol and not symbol_in_name(name, symbol):
         label = f"{name} ({symbol})"
+    if duplicate_index > 1:
+        label = f"{label} #{duplicate_index}"
     slug = sanitize_filename(coin_slug(url), limit=40)
     label = sanitize_filename(label, limit=60)
     parts = [part for part in (label, slug, coin_key(url)) if part]
@@ -511,7 +574,43 @@ def is_complete(record: dict) -> bool:
 
 
 def _capture_allowed(coin: Coin, include_unstarred: bool) -> bool:
-    return include_unstarred or coin.portfolio == "active"
+    """Capture the coins that still need portfolio attention by default.
+
+    The one-click flow is meant to focus on inactive or unknown portfolio entries
+    and to auto-add them before capture, while the explicit include flag remains a
+    broad opt-in to capture already-active entries as well.
+    """
+    if include_unstarred:
+        return True
+    return coin.portfolio in {"inactive", "unknown"}
+
+
+def _auto_add_inactive_coins(page: Page, selected: list[Coin]) -> tuple[list[Coin], list[dict]]:
+    """Ensure selected coins are in the active portfolio before capture.
+
+    A one-click collection should both protect the target page and add the coin to
+    the active portfolio so capture and favorites are aligned in a single step.
+    """
+    if not selected or not _is_authenticated(page):
+        return selected, []
+    queue = [coin for coin in selected if coin.portfolio != "active"]
+    if not queue:
+        return selected, []
+    results = add_coins_to_favorites(page, queue)
+    by_url = {
+        str(item["coin_url"]).rstrip("/").lower(): item
+        for item in results
+        if isinstance(item, dict) and item.get("coin_url")
+    }
+    refreshed: list[Coin] = []
+    for coin in selected:
+        key = coin.url.rstrip("/").lower()
+        status = by_url.get(key, {}).get("status")
+        if status in {"added", "already_active"}:
+            refreshed.append(replace(coin, portfolio="active"))
+        else:
+            refreshed.append(replace(coin, portfolio="unknown" if coin.portfolio == "unknown" else coin.portfolio))
+    return refreshed, results
 
 
 def retry(operation: Callable[[], T], attempts: int = RETRIES, delay: float = 1.0) -> T:
@@ -682,7 +781,7 @@ def _listing_page(page: Page, number: int) -> list[Coin]:
 
 
 _FAVORITE_CLICK_JS = r"""
-(url) => {
+(url, folderNumber = 1, bypassPortfolioPrompt = false) => {
   const normalize = (value) => {
     try { return new URL(value, location.href).pathname.replace(/\/+$/, ''); }
     catch (error) { return ''; }
@@ -693,16 +792,83 @@ _FAVORITE_CLICK_JS = r"""
   if (!anchor) return {found: false};
   const row = anchor.closest('tr, [role="row"]');
   if (!row) return {found: true, row: false, star: false};
-  const star = row.querySelector("i[data-action*='coin-favorites'], [data-action*='coin-favorites']");
+  const candidates = [
+    row.querySelector("i[data-action*='coin-favorites'], [data-action*='coin-favorites']"),
+    row.querySelector("button[aria-label*='portfolio' i], button[aria-label*='favorite' i], button[title*='portfolio' i], button[title*='favorite' i]"),
+    row.querySelector("[aria-label*='portfolio' i], [aria-label*='favorite' i], [title*='portfolio' i], [title*='favorite' i]"),
+    row.querySelector(".fa-star, .fas, .far, .fa-solid, .fa-regular")
+  ].filter(Boolean);
+  const star = candidates.find((element) => {
+    if (!element) return false;
+    const label = (element.getAttribute('aria-label') || element.getAttribute('title') || '').toLowerCase();
+    const event = (element.getAttribute('data-analytics-event') || '').toLowerCase();
+    const classes = Array.from(element.classList || []).map((name) => name.toLowerCase());
+    return element.matches('[data-action*="coin-favorites"], [aria-label*="portfolio" i], [aria-label*="favorite" i], [title*="portfolio" i], [title*="favorite" i]')
+      || classes.some((name) => name.includes('star') || name.includes('favorite') || name.includes('bookmark'))
+      || event.includes('portfolio')
+      || label.includes('portfolio') || label.includes('favorite');
+  });
   if (!star) return {found: true, row: true, star: false};
   const event = (star.getAttribute('data-analytics-event') || '').toLowerCase();
+  const label = (star.getAttribute('aria-label') || star.getAttribute('title') || '').toLowerCase();
   const active = event.includes('remove_portfolio')
+    || label.includes('remove from portfolio')
+    || label.includes('unfavorite')
+    || label.includes('unfollow')
     || star.classList.contains('fas')
-    || star.classList.contains('fa-solid');
+    || star.classList.contains('fa-solid')
+    || star.getAttribute('aria-pressed') === 'true'
+    || star.getAttribute('aria-checked') === 'true'
+    || star.getAttribute('data-state') === 'active';
   if (active) return {found: true, row: true, star: true, active: true, clicked: false};
+
+  const trySelectFolder = () => {
+    const modal = document.querySelector('[role="dialog"], [data-testid*="portfolio" i], [data-testid*="watchlist" i], .modal');
+    if (!modal) return false;
+    const folderText = String(folderNumber);
+    const folderCandidates = [...modal.querySelectorAll('button, [role="button"], [data-testid], div')].filter((node) => {
+      const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      return text === folderText || text === `Portfolio ${folderText}` || text === `Folder ${folderText}` || text === `#${folderText}`;
+    });
+    const folder = folderCandidates[0] || [...modal.querySelectorAll('button, [role="button"]')].find((node) => {
+      const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      return /\b(?:portfolio|folder)\b.*\b(?:0|[1-9]\d*)\b/i.test(text) || text === String(folderNumber);
+    });
+    if (folder) {
+      folder.click();
+      return true;
+    }
+    const addButton = [...modal.querySelectorAll('button, [role="button"]')].find((node) => {
+      const text = (node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      return text.includes('new folder') || text.includes('create folder') || text.includes('add folder');
+    });
+    if (addButton) {
+      addButton.click();
+      const nameInput = modal.querySelector('input, textarea, [contenteditable="true"]');
+      if (nameInput) {
+        const before = nameInput.value || nameInput.textContent || '';
+        if (!before) {
+          nameInput.value = String(folderNumber);
+          nameInput.dispatchEvent(new Event('input', {bubbles: true}));
+          nameInput.dispatchEvent(new Event('change', {bubbles: true}));
+        }
+      }
+      const saveButton = [...modal.querySelectorAll('button, [role="button"]')].find((node) => {
+        const text = (node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        return text.includes('save') || text.includes('create') || text.includes('ok');
+      });
+      if (saveButton) saveButton.click();
+      return true;
+    }
+    return false;
+  };
+
   const clickable = star.closest('button, [role="button"]') || star;
   clickable.click();
-  return {found: true, row: true, star: true, active: false, clicked: true};
+  if (!bypassPortfolioPrompt) {
+    setTimeout(() => trySelectFolder(), 150);
+  }
+  return {found: true, row: true, star: true, active: false, clicked: true, folderNumber};
 }
 """
 
@@ -718,12 +884,30 @@ _FAVORITE_STATE_JS = r"""
   if (!anchor) return false;
   const row = anchor.closest('tr, [role="row"]');
   if (!row) return false;
-  const star = row.querySelector("i[data-action*='coin-favorites'], [data-action*='coin-favorites']");
+  const candidates = [
+    row.querySelector("i[data-action*='coin-favorites'], [data-action*='coin-favorites']"),
+    row.querySelector("button[aria-label*='portfolio' i], button[aria-label*='favorite' i], button[title*='portfolio' i], button[title*='favorite' i]"),
+    row.querySelector("[aria-label*='portfolio' i], [aria-label*='favorite' i], [title*='portfolio' i], [title*='favorite' i]"),
+    row.querySelector(".fa-star, .fas, .far, .fa-solid, .fa-regular")
+  ].filter(Boolean);
+  const star = candidates.find((element) => {
+    const label = (element.getAttribute('aria-label') || element.getAttribute('title') || '').toLowerCase();
+    const event = (element.getAttribute('data-analytics-event') || '').toLowerCase();
+    const classes = Array.from(element.classList || []).map((name) => name.toLowerCase());
+    return event.includes('portfolio') || label.includes('portfolio') || label.includes('favorite') || classes.some((name) => name.includes('star'));
+  });
   if (!star) return false;
   const event = (star.getAttribute('data-analytics-event') || '').toLowerCase();
+  const label = (star.getAttribute('aria-label') || star.getAttribute('title') || '').toLowerCase();
   return event.includes('remove_portfolio')
+    || label.includes('remove from portfolio')
+    || label.includes('unfavorite')
+    || label.includes('unfollow')
     || star.classList.contains('fas')
-    || star.classList.contains('fa-solid');
+    || star.classList.contains('fa-solid')
+    || star.getAttribute('aria-pressed') === 'true'
+    || star.getAttribute('aria-checked') === 'true'
+    || star.getAttribute('data-state') === 'active';
 }
 """
 
@@ -739,6 +923,7 @@ def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
         groups.setdefault(coin.page, []).append(coin)
 
     results: list[dict] = []
+    folder_cursor = 1
     for page_number, group in sorted(groups.items()):
         try:
             _navigate(page, page_url(page_number))
@@ -761,17 +946,23 @@ def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
                 "coin_url": coin.url,
                 "display_name": coin.label(),
                 "symbol": coin.symbol,
+                "portfolio_folder": portfolio_folder_number(folder_cursor),
             }
             if not authenticated:
                 record["status"] = "login_required"
                 results.append(record)
+                folder_cursor += 1
                 continue
             if coin.portfolio == "active":
                 record["status"] = "already_active"
                 results.append(record)
+                folder_cursor += 1
                 continue
             try:
-                outcome = page.evaluate(_FAVORITE_CLICK_JS, coin.url)
+                if is_tokenized_stock_name(coin.name, coin.symbol):
+                    outcome = page.evaluate(_FAVORITE_CLICK_JS, coin.url, record["portfolio_folder"], True)
+                else:
+                    outcome = page.evaluate(_FAVORITE_CLICK_JS, coin.url, record["portfolio_folder"])
                 if not outcome.get("found"):
                     record["status"] = "row_not_found"
                 elif not outcome.get("star"):
@@ -790,8 +981,52 @@ def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
             except Exception as error:
                 record["status"] = f"failed:{type(error).__name__}"
             results.append(record)
+            folder_cursor += 1
             page.wait_for_timeout(400)
     return results
+
+
+def _compress_pdf_if_needed(path: Path, threshold_bytes: int = 2 * 1024 * 1024) -> None:
+    """Reduce large PDFs with a best-effort external optimizer when available."""
+    if not path.exists():
+        return
+    if path.stat().st_size < threshold_bytes:
+        return
+    executable = shutil.which("magick") or shutil.which("convert")
+    if not executable:
+        return
+    compressed = path.with_name(f"{path.stem}.compressed{path.suffix}")
+    command = [
+        executable,
+        "-quiet",
+        "-density",
+        "150",
+        str(path),
+        "-quality",
+        "75",
+        "-compress",
+        "Zip",
+        "-define",
+        "pdf:use-cropbox=true",
+        str(compressed),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except (OSError, ValueError):
+        return
+    if result.returncode != 0 or not compressed.exists():
+        return
+    if compressed.stat().st_size >= path.stat().st_size:
+        compressed.unlink(missing_ok=True)
+        return
+    os.replace(compressed, path)
 
 
 def _download_pdf(url: str, target: Path) -> tuple[bool, str]:
@@ -820,6 +1055,7 @@ def _download_pdf(url: str, target: Path) -> tuple[bool, str]:
                         raise ValueError(f"PDF exceeds the {MAX_PDF_BYTES // (1024 * 1024)} MB safety limit")
                     handle.write(chunk)
             os.replace(temporary, target)
+            _compress_pdf_if_needed(target)
             return True, f"pdf:{content_type or 'unknown-content-type'}"
     finally:
         temporary.unlink(missing_ok=True)
@@ -947,9 +1183,23 @@ def _open_browser_session(
     return None, context, page, True
 
 
-def _open_whitepaper_sites(browser: str, profile: Path, urls: list[str]) -> None:
+def _open_whitepaper_sites(
+    browser: str,
+    profile: Path,
+    urls: list[str],
+    context: BrowserContext | None = None,
+) -> None:
     urls = list(dict.fromkeys(urls))
     if not urls:
+        return
+    if context is not None:
+        for url in urls:
+            try:
+                page = context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                page.wait_for_timeout(1000)
+            except Exception as error:
+                print(f"백서 탭 열기 실패: {url} ({type(error).__name__})")
         return
     executable = _browser_executable(browser)
     if not executable:
@@ -1046,6 +1296,7 @@ def _save_page_as_pdf(page: Page, target: Path) -> None:
             raise ValueError(f"PDF exceeds the {MAX_PDF_BYTES // (1024 * 1024)} MB safety limit")
         temporary.write_bytes(data)
         os.replace(temporary, target)
+        _compress_pdf_if_needed(target)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1110,6 +1361,7 @@ def _capture_coin(
                     f"{coin.url}|{website}",
                     "-website.png",
                     coin.symbol,
+                    duplicate_index=getattr(coin, "duplicate_index", 1),
                 )
                 _save_full_page_screenshot(page, screenshot)
                 details["screenshot"] = str(screenshot.relative_to(output_root))
@@ -1138,6 +1390,7 @@ def _capture_coin(
                     f"{coin.url}|{twitter}",
                     "-twitter.png",
                     coin.symbol,
+                    duplicate_index=getattr(coin, "duplicate_index", 1),
                 )
                 _save_full_page_screenshot(page, screenshot)
                 details["twitter_screenshot"] = str(screenshot.relative_to(output_root))
@@ -1163,6 +1416,7 @@ def _capture_coin(
                         f"{coin.url}|{explorer}",
                         "-explorer.png",
                         coin.symbol,
+                        duplicate_index=getattr(coin, "duplicate_index", 1),
                     )
                     _save_full_page_screenshot(page, screenshot)
                     details.setdefault("explorer_screenshots", []).append(
@@ -1180,7 +1434,14 @@ def _capture_coin(
 
     if whitepaper_status == "ok" and whitepaper:
         try:
-            target = output_path(pdf_dir, coin.name, coin.url, ".pdf", coin.symbol)
+            target = output_path(
+                pdf_dir,
+                coin.name,
+                coin.url,
+                ".pdf",
+                coin.symbol,
+                duplicate_index=getattr(coin, "duplicate_index", 1),
+            )
             ok, result = retry(lambda: _download_pdf(whitepaper, target))
             details["whitepaper_result"] = result
             if ok:
@@ -1193,12 +1454,22 @@ def _capture_coin(
                         raise ValueError(f"whitepaper_http_{response.status}")
                     _load_lazy_content(page)
                     screenshot = output_path(
-                        pdf_dir, coin.name, coin.url, "-whitepaper.png", coin.symbol
+                        pdf_dir,
+                        coin.name,
+                        coin.url,
+                        "-whitepaper.png",
+                        coin.symbol,
+                        duplicate_index=getattr(coin, "duplicate_index", 1),
                     )
                     _save_full_page_screenshot(page, screenshot)
                     details["whitepaper_screenshot"] = str(screenshot.relative_to(output_root))
                     rendered_pdf = output_path(
-                        pdf_dir, coin.name, coin.url, "-whitepaper.pdf", coin.symbol
+                        pdf_dir,
+                        coin.name,
+                        coin.url,
+                        "-whitepaper.pdf",
+                        coin.symbol,
+                        duplicate_index=getattr(coin, "duplicate_index", 1),
                     )
                     retry(lambda: _save_page_as_pdf(page, rendered_pdf))
                     details["pdf"] = str(rendered_pdf.relative_to(output_root))
@@ -1432,6 +1703,24 @@ def run(args: argparse.Namespace) -> int:
                 added = sum(1 for item in favorite_results if item["status"] == "added")
                 print(f"즐겨찾기 추가: {added}개 / 처리 {len(favorite_results)}개")
             else:
+                selected, auto_favorite_results = _auto_add_inactive_coins(page, selected)
+                if auto_favorite_results:
+                    result["favorites"].extend(auto_favorite_results)
+                    for item in auto_favorite_results:
+                        existing = manifest["coins"].get(item["coin_url"], {})
+                        existing.update(
+                            name=item.get("display_name") or item["coin_url"],
+                            display_name=item.get("display_name"),
+                            symbol=item.get("symbol"),
+                            coin_url=item["coin_url"],
+                            favorite_status=item["status"],
+                        )
+                        if item["status"] in {"added", "already_active"}:
+                            existing["portfolio"] = "active"
+                        manifest["coins"][item["coin_url"]] = existing
+                    _save_manifest(manifest_path, manifest)
+                    added = sum(1 for item in auto_favorite_results if item["status"] == "added")
+                    print(f"원클릭 수집 전 자동 즐겨찾기: {added}개 추가 / 처리 {len(auto_favorite_results)}개")
                 for coin in selected:
                     if not _capture_allowed(coin, args.include_unstarred):
                         if coin.portfolio == "unknown":
@@ -1474,12 +1763,8 @@ def run(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
 
-    if whitepaper_sites and owns_context:
-        _open_whitepaper_sites(args.browser, profile, whitepaper_sites)
-    elif whitepaper_sites:
-        print("검토용 백서 사이트(실사용 Chrome 탭을 건드리지 않기 위해 자동으로 열지 않음):")
-        for site in whitepaper_sites:
-            print(f"- {site}")
+    if whitepaper_sites:
+        _open_whitepaper_sites(args.browser, profile, whitepaper_sites, context=context)
 
     result["finished_at"] = datetime.now().astimezone().isoformat()
     result["paths"] = {

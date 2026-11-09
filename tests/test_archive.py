@@ -30,6 +30,9 @@ from coingecko_archive import (
     _is_authenticated,
     _twitter_account_unavailable,
     _capture_coin,
+    _auto_add_inactive_coins,
+    is_tokenized_stock_name,
+    portfolio_folder_number,
     sanitize_filename,
 )
 
@@ -55,6 +58,49 @@ def test_browser_resolution_fails_closed_when_selected_browser_missing(tmp_path,
 
     assert _browser_executable("chrome") is None
     assert _browser_executable("edge") is None
+
+
+def test_open_whitepaper_sites_uses_browser_context_tabs_when_available(tmp_path):
+    opened = []
+
+    class FakePage:
+        def goto(self, url, **kwargs):
+            opened.append(url)
+
+        def wait_for_timeout(self, *_args, **_kwargs):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    archive._open_whitepaper_sites(
+        "chrome",
+        tmp_path,
+        ["https://example.com/doc-a", "https://example.com/doc-b"],
+        context=FakeContext(),
+    )
+
+    assert opened == ["https://example.com/doc-a", "https://example.com/doc-b"]
+
+
+def test_large_pdf_is_optimized_with_best_effort_external_tool(monkeypatch, tmp_path):
+    target = tmp_path / "doc.pdf"
+    target.write_bytes(b"%PDF-1.4\n" + b"X" * 4096)
+    compressed = tmp_path / "doc.compressed.pdf"
+    compressed.write_bytes(b"%PDF-1.4\n" + b"Y" * 512)
+
+    monkeypatch.setattr(archive.shutil, "which", lambda name: "convert" if name in {"magick", "convert"} else None)
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "convert"
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(archive.subprocess, "run", fake_run)
+
+    archive._compress_pdf_if_needed(target, threshold_bytes=1)
+    assert target.exists()
+    assert target.read_bytes().startswith(b"%PDF-1.4")
 
 
 def test_listing_explicit_portfolio_state_and_unknown_fail_closed():
@@ -96,6 +142,13 @@ def test_coingecko_star_icons_and_recent_age_are_parsed_from_rows():
         "Inactive",
         "Active",
     ]
+
+
+def test_capture_allowed_targets_unstarred_items_by_default_and_all_when_explicitly_requested():
+    assert _capture_allowed(Coin("Inactive", "https://example.com/inactive", "inactive", 1), False)
+    assert _capture_allowed(Coin("Unknown", "https://example.com/unknown", "unknown", 1), False)
+    assert not _capture_allowed(Coin("Already Active", "https://example.com/active", "active", 1), False)
+    assert _capture_allowed(Coin("Already Active", "https://example.com/active", "active", 1), True)
 
 
 def test_recent_age_filter_is_conservative_for_unknown_and_seven_day_boundary():
@@ -341,14 +394,14 @@ def test_completion_and_bounded_retry():
     assert attempts == 2
 
 
-def test_capture_requires_active_star_unless_explicitly_overridden():
+def test_capture_targets_unstarred_coins_by_default_and_all_when_explicitly_requested():
     active = Coin("Active", "https://example.com/active", "active", 1)
     inactive = Coin("Inactive", "https://example.com/inactive", "inactive", 1)
     unknown = Coin("Unknown", "https://example.com/unknown", "unknown", 1)
 
-    assert _capture_allowed(active, include_unstarred=False)
-    assert not _capture_allowed(inactive, include_unstarred=False)
-    assert not _capture_allowed(unknown, include_unstarred=False)
+    assert not _capture_allowed(active, include_unstarred=False)
+    assert _capture_allowed(inactive, include_unstarred=False)
+    assert _capture_allowed(unknown, include_unstarred=False)
     assert all(_capture_allowed(coin, include_unstarred=True) for coin in (active, inactive, unknown))
 
 
@@ -499,6 +552,62 @@ def test_output_path_contains_symbol_and_slug_separator(tmp_path):
     assert "Whale Coin (WHALE)" in target.name
     assert "whale-4" in target.name
     assert target.name.endswith("-website.png")
+
+
+def test_output_path_includes_duplicate_suffix_for_same_name_entries(tmp_path):
+    target = output_path(
+        tmp_path,
+        "Example",
+        "https://www.coingecko.com/en/coins/example-2",
+        "-website.png",
+        "EX",
+        duplicate_index=2,
+    )
+    assert "Example (EX) #2" in target.name
+    assert "example-2" in target.name
+
+
+def test_tokenized_stock_names_bypass_portfolio_prompt_and_folder_rollover_starts_from_latest_folder():
+    assert is_tokenized_stock_name("Tokenized Stock", "TST")
+    assert is_tokenized_stock_name("bStocks Tokenized Stock", "BST")
+    assert not is_tokenized_stock_name("Example Coin", "EX")
+    assert portfolio_folder_number(1) == 16
+    assert portfolio_folder_number(1000) == 16
+    assert portfolio_folder_number(1001) == 17
+    assert portfolio_folder_number(2000) == 17
+    assert portfolio_folder_number(2001) == 18
+
+
+def test_parse_listing_html_reads_toggle_state_from_aria_label_and_data_action():
+    html = """
+    <table><tbody>
+      <tr>
+        <td><button aria-label="Remove from portfolio" data-action="coin-favorites#toggle" aria-pressed="true"></button></td>
+        <td><a href="/en/coins/example">Example</a></td>
+        <td>2 days</td>
+      </tr>
+    </tbody></table>
+    """
+    coins = parse_listing_html(html, 1)
+    assert coins[0].portfolio == "active"
+
+
+def test_auto_add_inactive_coins_promotes_to_active_before_capture(monkeypatch):
+    coin = Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1, "1 hour", "EX")
+    unknown = Coin("Unknown", "https://www.coingecko.com/en/coins/unknown", "unknown", 1, "1 hour", "UNK")
+
+    monkeypatch.setattr(archive, "_is_authenticated", lambda page: True)
+    monkeypatch.setattr(archive, "add_coins_to_favorites", lambda page, coins: [{
+        "coin_url": coin.url if coin.url == item.url else unknown.url,
+        "display_name": item.label(),
+        "symbol": item.symbol,
+        "status": "added",
+    } for item in coins])
+
+    refreshed, results = _auto_add_inactive_coins(SimpleNamespace(), [coin, unknown])
+    assert refreshed[0].portfolio == "active"
+    assert refreshed[1].portfolio == "active"
+    assert results[0]["status"] == "added"
 
 
 def test_devtools_active_port_parser_and_missing_file(tmp_path):
