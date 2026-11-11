@@ -27,7 +27,6 @@ from coingecko_archive import (
     _save_preview,
     _save_full_page_screenshot,
     _save_page_as_pdf,
-    _capture_allowed,
     _is_authenticated,
     _twitter_account_unavailable,
     _capture_coin,
@@ -149,16 +148,6 @@ def test_coingecko_star_icons_and_recent_age_are_parsed_from_rows():
         "Inactive",
         "Active",
     ]
-
-
-def test_capture_allowed_requires_successful_addition_by_default():
-    inactive = Coin("Inactive", "https://example.com/inactive", "inactive", 1)
-    unknown = Coin("Unknown", "https://example.com/unknown", "unknown", 1)
-    assert not _capture_allowed(inactive, False)
-    assert not _capture_allowed(unknown, False)
-    assert _capture_allowed(inactive, False, auto_added=True)
-    assert not _capture_allowed(Coin("Already Active", "https://example.com/active", "active", 1), False)
-    assert all(_capture_allowed(coin, True) for coin in (inactive, unknown))
 
 
 def test_recent_age_filter_is_conservative_for_unknown_and_seven_day_boundary():
@@ -404,17 +393,8 @@ def test_completion_and_bounded_retry():
     assert attempts == 2
 
 
-def test_capture_targets_unstarred_coins_by_default_and_all_when_explicitly_requested():
-    active = Coin("Active", "https://example.com/active", "active", 1)
-    inactive = Coin("Inactive", "https://example.com/inactive", "inactive", 1)
-    unknown = Coin("Unknown", "https://example.com/unknown", "unknown", 1)
-
-    assert not _capture_allowed(active, include_unstarred=False)
-    assert not _capture_allowed(inactive, include_unstarred=False)
-    assert not _capture_allowed(unknown, include_unstarred=False)
-    assert _capture_allowed(inactive, include_unstarred=False, auto_added=True)
-    assert _capture_allowed(active, include_unstarred=False, auto_added=True)
-    assert all(_capture_allowed(coin, include_unstarred=True) for coin in (active, inactive, unknown))
+def test_capture_then_favorite_orders_normal_coins_and_skips_tokenized_capture(monkeypatch, tmp_path):
+    normal = Coin("Example", "https://example.com/coin", "active", 1)
     tokenized = Coin(
         "Example Tokenized Stock",
         "https://example.com/tokenized",
@@ -422,7 +402,48 @@ def test_capture_targets_unstarred_coins_by_default_and_all_when_explicitly_requ
         1,
         symbol="ETS",
     )
-    assert not _capture_allowed(tokenized, include_unstarred=True, auto_added=True)
+    events = []
+    monkeypatch.setattr(
+        archive,
+        "_capture_coin",
+        lambda *_args: (
+            events.append("capture")
+            or ({"status": "completed"}, "https://example.com/doc")
+        ),
+    )
+    monkeypatch.setattr(
+        archive,
+        "add_coins_to_favorites",
+        lambda _page, coins: events.append(f"favorite:{coins[0].name}")
+        or [{"coin_url": coins[0].url, "status": "already_active"}],
+    )
+
+    details, pending, favorites = archive._capture_then_favorite(
+        SimpleNamespace(),
+        normal,
+        tmp_path / "screenshots",
+        tmp_path / "whitepapers",
+        tmp_path,
+        {},
+        False,
+    )
+    tokenized_details, tokenized_pending, tokenized_favorites = archive._capture_then_favorite(
+        SimpleNamespace(),
+        tokenized,
+        tmp_path / "screenshots",
+        tmp_path / "whitepapers",
+        tmp_path,
+        {},
+        False,
+    )
+
+    assert events == ["capture", "favorite:Example", "favorite:Example Tokenized Stock"]
+    assert details == {"status": "completed"}
+    assert pending == "https://example.com/doc"
+    assert favorites[0]["status"] == "already_active"
+    assert tokenized_details is None
+    assert tokenized_pending is None
+    assert tokenized_favorites[0]["status"] == "already_active"
 
 
 def test_full_page_screenshot_saves_atomically_and_cleans_temporary_file(tmp_path):

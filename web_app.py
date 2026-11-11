@@ -334,7 +334,6 @@ def _command(
     since_days: int,
     browser: str,
     attach: bool,
-    include_unstarred: bool,
     force: bool,
     urls: list[str] | None,
     result_path: Path,
@@ -358,8 +357,6 @@ def _command(
     ]
     if attach:
         command.append("--attach")
-    if include_unstarred and mode == "capture":
-        command.append("--include-unstarred")
     if force:
         command.append("--force")
     if urls is not None:
@@ -367,12 +364,11 @@ def _command(
     return command
 
 
-def _validate(body: dict) -> tuple[int, int, str, bool, bool, bool, list[str] | None]:
+def _validate(body: dict) -> tuple[int, int, str, bool, bool, list[str] | None]:
     pages = int(body.get("pages", 10))
     since_days = int(body.get("since_days", 0))
     browser = str(body.get("browser", "chrome"))
     attach = bool(body.get("attach", True))
-    include_unstarred = bool(body.get("include_unstarred", False))
     force = bool(body.get("force", False))
     urls = body.get("urls")
     if not 1 <= pages <= 10:
@@ -385,18 +381,18 @@ def _validate(body: dict) -> tuple[int, int, str, bool, bool, bool, list[str] | 
         if not isinstance(urls, list):
             raise ValueError("urls는 문자열 배열이어야 합니다.")
         urls = [str(value) for value in urls if str(value).strip()]
-    return pages, since_days, browser, attach, include_unstarred, force, urls
+    return pages, since_days, browser, attach, force, urls
 
 
 def _start_job(kind: str, mode: str, body: dict) -> dict:
-    pages, since_days, browser, attach, include_unstarred, force, urls = _validate(body)
+    pages, since_days, browser, attach, force, urls = _validate(body)
     result_path = {
         "scan": LAST_SCAN,
         "capture": LAST_RESULT,
         "favorites": LAST_FAVORITES,
     }[kind]
     command = _command(
-        mode, pages, since_days, browser, attach, include_unstarred, force, urls, result_path
+        mode, pages, since_days, browser, attach, force, urls, result_path
     )
     job = MANAGER.start(kind, command, result_path)
     return {"job": job.to_dict(), "command": command}
@@ -807,7 +803,6 @@ INDEX_HTML = r"""<!doctype html>
     <div class="row">
       <label>페이지 <select id="pages"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option selected>10</option></select></label>
       <label>등록 기간 <select id="sinceDays"><option value="0" selected>페이지 전체</option><option value="1">1일</option><option value="3">3일</option><option value="7">7일</option><option value="14">14일</option><option value="30">30일</option></select></label>
-      <label class="small"><input type="checkbox" id="includeUnstarred"> 별표 상태와 무관하게 모두 수집</label>
       <label class="small"><input type="checkbox" id="force"> 완료된 코인도 다시 수집</label>
     </div>
     <div class="row">
@@ -1003,7 +998,6 @@ function requestBody() {
   return {
     pages: Number($("pages").value),
     since_days: Number($("sinceDays").value),
-    include_unstarred: $("includeUnstarred").checked,
     force: $("force").checked,
     attach: true,
     browser: "chrome",

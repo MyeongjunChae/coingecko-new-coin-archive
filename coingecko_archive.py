@@ -553,13 +553,6 @@ def is_complete(record: dict) -> bool:
     return record.get("status") == "completed"
 
 
-def _capture_allowed(coin: Coin, include_unstarred: bool, auto_added: bool = False) -> bool:
-    """Capture only newly added coins by default; Tokenized Stock entries are add-only."""
-    if is_tokenized_stock_name(coin.name, coin.symbol):
-        return False
-    return include_unstarred or auto_added
-
-
 def _auto_add_inactive_coins(page: Page, selected: list[Coin]) -> tuple[list[Coin], list[dict]]:
     """Ensure selected coins are in the active portfolio before capture.
 
@@ -1671,6 +1664,31 @@ def _capture_coin(
     return details, pending_site
 
 
+def _capture_then_favorite(
+    page: Page,
+    coin: Coin,
+    screenshot_dir: Path,
+    pdf_dir: Path,
+    output_root: Path,
+    existing: dict,
+    force: bool,
+) -> tuple[dict | None, str | None, list[dict]]:
+    details = None
+    pending_site = None
+    if not is_tokenized_stock_name(coin.name, coin.symbol):
+        if is_complete(existing) and not force:
+            print(f"건너뜀(캡처 완료): {coin.label()}")
+        else:
+            details, pending_site = _capture_coin(
+                page, coin, screenshot_dir, pdf_dir, output_root
+            )
+    else:
+        print(f"즐겨찾기 전용 처리(Tokenized Stock): {coin.label()}")
+
+    favorite_results = add_coins_to_favorites(page, [coin])
+    return details, pending_site, favorite_results
+
+
 def _open_setup_profile(executable: str, profile: Path) -> None:
     profile.mkdir(parents=True, exist_ok=True)
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1891,12 +1909,29 @@ def run(args: argparse.Namespace) -> int:
                 added = sum(1 for item in favorite_results if item["status"] == "added")
                 print(f"즐겨찾기 추가: {added}개 / 처리 {len(favorite_results)}개")
             else:
-                selected, auto_favorite_results = _auto_add_inactive_coins(page, selected)
-                if auto_favorite_results:
-                    result["favorites"].extend(auto_favorite_results)
-                    for item in auto_favorite_results:
-                        existing = manifest["coins"].get(item["coin_url"], {})
-                        existing.update(
+                for coin in selected:
+                    existing = manifest["coins"].get(coin.url, {})
+                    details, pending_site, coin_favorites = _capture_then_favorite(
+                        page,
+                        coin,
+                        screenshot_dir,
+                        pdf_dir,
+                        output_root,
+                        existing,
+                        args.force,
+                    )
+                    if details is not None:
+                        manifest["coins"][coin.url] = details
+                        capture_results.append(details)
+                        result["captures"] = capture_results
+                        _save_capture_report(report_path, capture_results)
+                        print(f"{details['status']}: {coin.label()}")
+                    if pending_site:
+                        whitepaper_sites.append(pending_site)
+                    result["favorites"].extend(coin_favorites)
+                    for item in coin_favorites:
+                        favorite_record = manifest["coins"].get(item["coin_url"], {})
+                        favorite_record.update(
                             name=item.get("display_name") or item["coin_url"],
                             display_name=item.get("display_name"),
                             symbol=item.get("symbol"),
@@ -1904,55 +1939,10 @@ def run(args: argparse.Namespace) -> int:
                             favorite_status=item["status"],
                         )
                         if item["status"] in {"added", "already_active"}:
-                            existing["portfolio"] = "active"
-                        manifest["coins"][item["coin_url"]] = existing
+                            favorite_record["portfolio"] = "active"
+                        manifest["coins"][item["coin_url"]] = favorite_record
+                        print(f"즐겨찾기 결과: {item['status']} - {item.get('display_name')}")
                     _save_manifest(manifest_path, manifest)
-                    added = sum(1 for item in auto_favorite_results if item["status"] == "added")
-                    print(f"원클릭 수집 전 자동 즐겨찾기: {added}개 추가 / 처리 {len(auto_favorite_results)}개")
-                auto_added_urls = {
-                    item["coin_url"].rstrip("/").lower()
-                    for item in auto_favorite_results
-                    if isinstance(item, dict)
-                    and item.get("status") == "added"
-                    and item.get("coin_url")
-                }
-                for coin in selected:
-                    if is_tokenized_stock_name(coin.name, coin.symbol):
-                        print(f"즐겨찾기 전용 처리(Tokenized Stock): {coin.label()}")
-                        continue
-                    auto_added = coin.url.rstrip("/").lower() in auto_added_urls
-                    if not _capture_allowed(coin, args.include_unstarred, auto_added=auto_added):
-                        print(f"건너뜀(새 즐겨찾기 추가 확인 안 됨): {coin.label()}")
-                        if coin.portfolio == "unknown":
-                            existing = manifest["coins"].get(coin.url, {})
-                            existing.update(
-                                name=coin.name,
-                                symbol=coin.symbol,
-                                display_name=coin.label(),
-                                coin_url=coin.url,
-                                portfolio="unknown",
-                                status="needs_review",
-                            )
-                            review = existing.setdefault("review", [])
-                            if "portfolio_state_unknown_fail_closed" not in review:
-                                review.append("portfolio_state_unknown_fail_closed")
-                            manifest["coins"][coin.url] = existing
-                        continue
-                    existing = manifest["coins"].get(coin.url, {})
-                    if is_complete(existing) and not args.force:
-                        print(f"건너뜀(완료됨): {coin.label()}")
-                        continue
-                    details, pending_site = _capture_coin(
-                        page, coin, screenshot_dir, pdf_dir, output_root
-                    )
-                    manifest["coins"][coin.url] = details
-                    capture_results.append(details)
-                    result["captures"] = capture_results
-                    _save_capture_report(report_path, capture_results)
-                    if pending_site:
-                        whitepaper_sites.append(pending_site)
-                    _save_manifest(manifest_path, manifest)
-                    print(f"{details['status']}: {coin.label()}")
                     page.wait_for_timeout(1500)
         finally:
             if owns_context:
@@ -2018,11 +2008,6 @@ def main() -> int:
         "--force",
         action="store_true",
         help="Re-capture coins whose manifest status is already completed.",
-    )
-    parser.add_argument(
-        "--include-unstarred",
-        action="store_true",
-        help="Capture all recent coins regardless of login or portfolio-star state.",
     )
     args = parser.parse_args()
     if not 1 <= args.pages <= 10:
