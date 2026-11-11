@@ -32,7 +32,6 @@ from playwright.sync_api import (
 LIST_URL = "https://www.coingecko.com/en/new-cryptocurrencies"
 MAX_PDF_BYTES = 100 * 1024 * 1024
 RETRIES = 3
-PORTFOLIO_FOLDER_START = 16
 PORTFOLIO_FOLDER_SIZE = 1000
 T = TypeVar("T")
 
@@ -106,28 +105,9 @@ def symbol_in_name(name: str, symbol: str) -> bool:
 
 
 def is_tokenized_stock_name(name: str, symbol: str = "") -> bool:
-    """CoinGecko tokenized stock entries often open an extra folder-picker step.
-
-    Those entries should be added directly without the extra confirmation flow,
-    while still continuing on to the next coin in the batch.
-    """
+    """Identify tokenized securities that should be favorited without capture."""
     text = " ".join((name, symbol)).casefold()
     return "tokenized" in text and ("stock" in text or "share" in text or "token" in text)
-
-
-def portfolio_folder_number(
-    index: int,
-    per_folder_limit: int = PORTFOLIO_FOLDER_SIZE,
-    start_folder: int = PORTFOLIO_FOLDER_START,
-) -> int:
-    """Return the active portfolio folder for a bulk favorites run.
-
-    When the newest existing folder is 16, the next additions should start from 16
-    and then roll to 17 once that folder reaches its capacity.
-    """
-    if index <= 0:
-        return max(1, start_folder)
-    return start_folder + ((index - 1) // per_folder_limit)
 
 
 def assign_duplicate_indices(coins: Iterable[Coin]) -> list[Coin]:
@@ -573,16 +553,11 @@ def is_complete(record: dict) -> bool:
     return record.get("status") == "completed"
 
 
-def _capture_allowed(coin: Coin, include_unstarred: bool) -> bool:
-    """Capture the coins that still need portfolio attention by default.
-
-    The one-click flow is meant to focus on inactive or unknown portfolio entries
-    and to auto-add them before capture, while the explicit include flag remains a
-    broad opt-in to capture already-active entries as well.
-    """
-    if include_unstarred:
-        return True
-    return coin.portfolio in {"inactive", "unknown"}
+def _capture_allowed(coin: Coin, include_unstarred: bool, auto_added: bool = False) -> bool:
+    """Capture only newly added coins by default; Tokenized Stock entries are add-only."""
+    if is_tokenized_stock_name(coin.name, coin.symbol):
+        return False
+    return include_unstarred or auto_added
 
 
 def _auto_add_inactive_coins(page: Page, selected: list[Coin]) -> tuple[list[Coin], list[dict]]:
@@ -591,11 +566,21 @@ def _auto_add_inactive_coins(page: Page, selected: list[Coin]) -> tuple[list[Coi
     A one-click collection should both protect the target page and add the coin to
     the active portfolio so capture and favorites are aligned in a single step.
     """
-    if not selected or not _is_authenticated(page):
+    if not selected:
         return selected, []
     queue = [coin for coin in selected if coin.portfolio != "active"]
     if not queue:
         return selected, []
+    if not _is_authenticated(page):
+        return selected, [
+            {
+                "coin_url": coin.url,
+                "display_name": coin.label(),
+                "symbol": coin.symbol,
+                "status": "login_required",
+            }
+            for coin in queue
+        ]
     results = add_coins_to_favorites(page, queue)
     by_url = {
         str(item["coin_url"]).rstrip("/").lower(): item
@@ -780,209 +765,359 @@ def _listing_page(page: Page, number: int) -> list[Coin]:
     return coins
 
 
-_FAVORITE_CLICK_JS = r"""
-(url, folderNumber = 1, bypassPortfolioPrompt = false) => {
-  const normalize = (value) => {
-    try { return new URL(value, location.href).pathname.replace(/\/+$/, ''); }
-    catch (error) { return ''; }
+_COIN_DETAIL_PORTFOLIO_STATE_JS = r"""
+() => {
+  const visible = (element) => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0
+      && getComputedStyle(element).visibility !== 'hidden';
   };
-  const target = normalize(url);
-  const anchor = [...document.querySelectorAll('a[href]')]
-    .find((item) => normalize(item.href) === target);
-  if (!anchor) return {found: false};
-  const row = anchor.closest('tr, [role="row"]');
-  if (!row) return {found: true, row: false, star: false};
-  const candidates = [
-    row.querySelector("i[data-action*='coin-favorites'], [data-action*='coin-favorites']"),
-    row.querySelector("button[aria-label*='portfolio' i], button[aria-label*='favorite' i], button[title*='portfolio' i], button[title*='favorite' i]"),
-    row.querySelector("[aria-label*='portfolio' i], [aria-label*='favorite' i], [title*='portfolio' i], [title*='favorite' i]"),
-    row.querySelector(".fa-star, .fas, .far, .fa-solid, .fa-regular")
-  ].filter(Boolean);
-  const star = candidates.find((element) => {
-    if (!element) return false;
-    const label = (element.getAttribute('aria-label') || element.getAttribute('title') || '').toLowerCase();
-    const event = (element.getAttribute('data-analytics-event') || '').toLowerCase();
-    const classes = Array.from(element.classList || []).map((name) => name.toLowerCase());
-    return element.matches('[data-action*="coin-favorites"], [aria-label*="portfolio" i], [aria-label*="favorite" i], [title*="portfolio" i], [title*="favorite" i]')
-      || classes.some((name) => name.includes('star') || name.includes('favorite') || name.includes('bookmark'))
-      || event.includes('portfolio')
-      || label.includes('portfolio') || label.includes('favorite');
-  });
-  if (!star) return {found: true, row: true, star: false};
-  const event = (star.getAttribute('data-analytics-event') || '').toLowerCase();
-  const label = (star.getAttribute('aria-label') || star.getAttribute('title') || '').toLowerCase();
-  const active = event.includes('remove_portfolio')
-    || label.includes('remove from portfolio')
-    || label.includes('unfavorite')
-    || label.includes('unfollow')
-    || star.classList.contains('fas')
-    || star.classList.contains('fa-solid')
-    || star.getAttribute('aria-pressed') === 'true'
-    || star.getAttribute('aria-checked') === 'true'
-    || star.getAttribute('data-state') === 'active';
-  if (active) return {found: true, row: true, star: true, active: true, clicked: false};
+  const buttons = [...document.querySelectorAll(
+    'button[data-action*="coin-favorites#handleCoinFavourites"]'
+  )].filter(visible);
+  const button = buttons.find((element) => {
+    const properties = element.getAttribute('data-analytics-event-properties') || '';
+    return properties.includes('"sub_origin":"primary_cta"');
+  }) || buttons[0];
+  if (!button) return 'unknown';
 
-  const trySelectFolder = () => {
-    const modal = document.querySelector('[role="dialog"], [data-testid*="portfolio" i], [data-testid*="watchlist" i], .modal');
-    if (!modal) return false;
-    const folderText = String(folderNumber);
-    const folderCandidates = [...modal.querySelectorAll('button, [role="button"], [data-testid], div')].filter((node) => {
-      const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-      return text === folderText || text === `Portfolio ${folderText}` || text === `Folder ${folderText}` || text === `#${folderText}`;
-    });
-    const folder = folderCandidates[0] || [...modal.querySelectorAll('button, [role="button"]')].find((node) => {
-      const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-      return /\b(?:portfolio|folder)\b.*\b(?:0|[1-9]\d*)\b/i.test(text) || text === String(folderNumber);
-    });
-    if (folder) {
-      folder.click();
-      return true;
-    }
-    const addButton = [...modal.querySelectorAll('button, [role="button"]')].find((node) => {
-      const text = (node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      return text.includes('new folder') || text.includes('create folder') || text.includes('add folder');
-    });
-    if (addButton) {
-      addButton.click();
-      const nameInput = modal.querySelector('input, textarea, [contenteditable="true"]');
-      if (nameInput) {
-        const before = nameInput.value || nameInput.textContent || '';
-        if (!before) {
-          nameInput.value = String(folderNumber);
-          nameInput.dispatchEvent(new Event('input', {bubbles: true}));
-          nameInput.dispatchEvent(new Event('change', {bubbles: true}));
-        }
-      }
-      const saveButton = [...modal.querySelectorAll('button, [role="button"]')].find((node) => {
-        const text = (node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        return text.includes('save') || text.includes('create') || text.includes('ok');
-      });
-      if (saveButton) saveButton.click();
-      return true;
-    }
-    return false;
-  };
-
-  const clickable = star.closest('button, [role="button"]') || star;
-  clickable.click();
-  if (!bypassPortfolioPrompt) {
-    setTimeout(() => trySelectFolder(), 150);
+  const event = (button.getAttribute('data-analytics-event') || '').toLowerCase();
+  const label = `${button.getAttribute('aria-label') || ''} ${button.innerText || ''}`.toLowerCase();
+  const star = button.querySelector('.fa-star, .fas, .far, .fa-solid, .fa-regular');
+  const classes = Array.from(star?.classList || []).map((name) => name.toLowerCase());
+  const controller = button.closest('[data-controller~="coin-favorites"]');
+  const dropdown = controller?.querySelector('[data-coin-favorites-target="dropdown"]');
+  const rows = [...(dropdown?.querySelectorAll(
+    'div[data-coin-favorites-target="dropdownItem"]'
+  ) || [])];
+  if (rows.some((row) => row.querySelector('i.fa-check, i.fa-check-circle'))) {
+    return 'active';
   }
-  return {found: true, row: true, star: true, active: false, clicked: true, folderNumber};
+  if (event.includes('remove_portfolio')
+      || label.includes('remove from portfolio')
+      || classes.includes('fas')
+      || classes.includes('fa-solid')) return 'active';
+  if (event.includes('select_add_portfolio_coin_cta')
+      && (classes.includes('far') || classes.includes('fa-regular'))) return 'inactive';
+  return 'unknown';
 }
 """
 
-_FAVORITE_STATE_JS = r"""
-(url) => {
-  const normalize = (value) => {
-    try { return new URL(value, location.href).pathname.replace(/\/+$/, ''); }
-    catch (error) { return ''; }
-  };
-  const target = normalize(url);
-  const anchor = [...document.querySelectorAll('a[href]')]
-    .find((item) => normalize(item.href) === target);
-  if (!anchor) return false;
-  const row = anchor.closest('tr, [role="row"]');
-  if (!row) return false;
-  const candidates = [
-    row.querySelector("i[data-action*='coin-favorites'], [data-action*='coin-favorites']"),
-    row.querySelector("button[aria-label*='portfolio' i], button[aria-label*='favorite' i], button[title*='portfolio' i], button[title*='favorite' i]"),
-    row.querySelector("[aria-label*='portfolio' i], [aria-label*='favorite' i], [title*='portfolio' i], [title*='favorite' i]"),
-    row.querySelector(".fa-star, .fas, .far, .fa-solid, .fa-regular")
-  ].filter(Boolean);
-  const star = candidates.find((element) => {
-    const label = (element.getAttribute('aria-label') || element.getAttribute('title') || '').toLowerCase();
-    const event = (element.getAttribute('data-analytics-event') || '').toLowerCase();
-    const classes = Array.from(element.classList || []).map((name) => name.toLowerCase());
-    return event.includes('portfolio') || label.includes('portfolio') || label.includes('favorite') || classes.some((name) => name.includes('star'));
-  });
-  if (!star) return false;
-  const event = (star.getAttribute('data-analytics-event') || '').toLowerCase();
-  const label = (star.getAttribute('aria-label') || star.getAttribute('title') || '').toLowerCase();
-  return event.includes('remove_portfolio')
-    || label.includes('remove from portfolio')
-    || label.includes('unfavorite')
-    || label.includes('unfollow')
-    || star.classList.contains('fas')
-    || star.classList.contains('fa-solid')
-    || star.getAttribute('aria-pressed') === 'true'
-    || star.getAttribute('aria-checked') === 'true'
-    || star.getAttribute('data-state') === 'active';
-}
-"""
+_DETAIL_PORTFOLIO_PICKER_SELECTOR = (
+    '[data-controller~="coin-favorites"]:has('
+    'button[data-coin-show-target="portfolioButton"]) '
+    '[data-coin-favorites-target="dropdown"]'
+)
+_PORTFOLIO_PICKER_ROW_SELECTOR = (
+    'div[data-coin-favorites-target="dropdownItem"]'
+    '[data-action*="click->coin-favorites#handle"]'
+)
+_PORTFOLIO_PICKER_PLUS_SELECTOR = (
+    f"{_DETAIL_PORTFOLIO_PICKER_SELECTOR} "
+    f"{_PORTFOLIO_PICKER_ROW_SELECTOR} i.fa-plus"
+)
+_NEW_PORTFOLIO_OPTION_SELECTOR = (
+    f'{_DETAIL_PORTFOLIO_PICKER_SELECTOR} '
+    '[data-action*="coin-favorites#handleNewPortfolio"]'
+)
+
+
+def _portfolio_label_number(label: str) -> int | None:
+    normalized = re.sub(r"[⭐\ufe0f]", "", " ".join(label.split())).strip().casefold()
+    match = re.fullmatch(r"(?:portfolio\s+|folder\s+|#)?(\d+)", normalized)
+    return int(match.group(1)) if match else None
+
+
+def _portfolio_folder_option_index(labels: Iterable[str], folder_number: int) -> int | None:
+    """Find an exact numbered CoinGecko portfolio label."""
+    for index, label in enumerate(labels):
+        if _portfolio_label_number(label) == folder_number:
+            return index
+    return None
+
+
+def _portfolio_options(page: Page) -> list[dict[str, int | str]]:
+    links = page.locator('a[data-portfolio-type="coin"]')
+    options: list[dict[str, int | str]] = []
+    for index, label in enumerate(links.all_inner_texts()):
+        number = _portfolio_label_number(label)
+        href = links.nth(index).get_attribute("href")
+        if number is not None and href:
+            options.append({"number": number, "href": href, "label": label.strip()})
+    return options
+
+
+def _portfolio_asset_urls(page: Page, portfolio_href: str) -> set[str]:
+    next_url = urljoin("https://www.coingecko.com", portfolio_href)
+    expected_path = urlsplit(next_url).path.rstrip("/")
+    visited: set[str] = set()
+    assets: set[str] = set()
+    for _ in range(100):
+        if next_url in visited:
+            break
+        visited.add(next_url)
+        _navigate(page, next_url)
+        if urlsplit(page.url).path.rstrip("/") != expected_path:
+            raise RuntimeError(f"Portfolio page did not load: {next_url}")
+        rows = page.locator("table tbody tr")
+        for row_index in range(rows.count()):
+            coin_links = rows.nth(row_index).locator('a[href*="/coins/"]')
+            for link_index in range(coin_links.count()):
+                href = coin_links.nth(link_index).get_attribute("href")
+                if href:
+                    parts = urlsplit(urljoin(next_url, href))
+                    if re.fullmatch(r"/en/coins/[^/]+", parts.path):
+                        assets.add(parts.path.rstrip("/"))
+
+        next_links = page.locator('a[aria-label="next"], a[rel="next"]')
+        next_href = None
+        for link_index in range(next_links.count()):
+            link = next_links.nth(link_index)
+            if link.is_visible():
+                candidate = link.get_attribute("href")
+                if candidate:
+                    next_href = urljoin(next_url, candidate)
+                    break
+        if not next_href:
+            break
+        next_url = next_href
+    return assets
+
+
+def _open_coin_portfolio_picker(page: Page, coin: Coin) -> str:
+    try:
+        _navigate(page, coin.url)
+        state = page.evaluate(_COIN_DETAIL_PORTFOLIO_STATE_JS)
+        if state != "inactive":
+            return state
+        button = page.locator(
+            'button[data-action*="coin-favorites#handleCoinFavourites"]'
+            '[data-analytics-event="select_add_portfolio_coin_cta"]'
+            '[data-analytics-event-properties*="primary_cta"]'
+        )
+        button.click(timeout=15_000)
+        page.wait_for_selector(
+            _NEW_PORTFOLIO_OPTION_SELECTOR,
+            state="attached",
+            timeout=15_000,
+        )
+        state = _coin_detail_portfolio_state(page)
+        if state == "active":
+            return "active"
+        return "opened" if state == "inactive" else "unknown"
+    except PlaywrightTimeoutError:
+        return "picker_timeout"
+
+
+def _click_portfolio_row_plus(page: Page, folder_number: int) -> dict:
+    page.wait_for_selector(
+        _PORTFOLIO_PICKER_PLUS_SELECTOR,
+        state="visible",
+        timeout=15_000,
+    )
+    page.wait_for_timeout(200)
+    dropdown = page.locator(_DETAIL_PORTFOLIO_PICKER_SELECTOR)
+    rows = dropdown.locator(_PORTFOLIO_PICKER_ROW_SELECTOR)
+    matches = [
+        rows.nth(index)
+        for index in range(rows.count())
+        if _portfolio_label_number(rows.nth(index).inner_text()) == folder_number
+    ]
+    if not matches:
+        return {"found": False, "reason": "portfolio_row_not_found"}
+    if len(matches) > 1:
+        return {"found": False, "reason": "portfolio_row_ambiguous"}
+
+    plus = matches[0].locator("i.fa-plus")
+    if plus.count() != 1:
+        return {"found": False, "reason": "portfolio_row_plus_not_found"}
+    plus.click(timeout=10_000)
+    matches[0].locator("i.fa-check").wait_for(state="visible", timeout=10_000)
+    return {"found": True, "clicked": True, "verified": True}
+
+
+def _create_portfolio(page: Page, folder_number: int) -> dict[str, int | str] | None:
+    create_link = page.locator(
+        _NEW_PORTFOLIO_OPTION_SELECTOR
+    ).first
+    if not create_link.count():
+        return None
+    create_link.click(timeout=10_000)
+    page.wait_for_timeout(200)
+
+    name_input = None
+    inputs = page.locator("input")
+    for index in range(inputs.count()):
+        candidate = inputs.nth(index)
+        if not candidate.is_visible():
+            continue
+        identifier = " ".join(
+            filter(
+                None,
+                (
+                    candidate.get_attribute("name"),
+                    candidate.get_attribute("placeholder"),
+                    candidate.get_attribute("aria-label"),
+                ),
+            )
+        ).casefold()
+        if "name" in identifier or "portfolio" in identifier:
+            name_input = candidate
+            break
+    if name_input is None:
+        return None
+    name_input.fill(str(folder_number))
+
+    form = name_input.locator("xpath=ancestor::form")
+    submit = form.locator('button[type="submit"], input[type="submit"]')
+    if submit.count() and submit.first.is_visible():
+        submit.first.click(timeout=10_000)
+    else:
+        buttons = page.get_by_role("button", name=re.compile(r"create|save", re.IGNORECASE))
+        visible_buttons = [
+            buttons.nth(index)
+            for index in range(buttons.count())
+            if buttons.nth(index).is_visible()
+        ]
+        if not visible_buttons:
+            return None
+        visible_buttons[-1].click(timeout=10_000)
+
+    page.wait_for_timeout(500)
+    for option in _portfolio_options(page):
+        if option["number"] == folder_number:
+            return option
+    return None
+
+
+def _coin_detail_portfolio_state(page: Page) -> str:
+    return page.evaluate(_COIN_DETAIL_PORTFOLIO_STATE_JS)
 
 
 def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
-    """Click CoinGecko's star for the selected coins and verify each change.
-
-    This only works with a signed-in session. It never clicks a star that is
-    already active and it records a review status instead of guessing.
-    """
-    groups: dict[int, list[Coin]] = {}
-    for coin in coins:
-        groups.setdefault(coin.page, []).append(coin)
-
+    """Add unstarred coins to the newest portfolio, verifying capacity and success."""
     results: list[dict] = []
-    folder_cursor = 1
-    for page_number, group in sorted(groups.items()):
-        try:
-            _navigate(page, page_url(page_number))
-            page.wait_for_selector("a[href*='/coins/']", timeout=15_000)
-        except Exception as error:
-            for coin in group:
-                results.append(
-                    {
-                        "coin_url": coin.url,
-                        "display_name": coin.label(),
-                        "symbol": coin.symbol,
-                        "status": f"page_failed:{type(error).__name__}",
-                    }
-                )
+    seen_urls: set[str] = set()
+    latest_folder: dict[str, int | str] | None = None
+    folder_count = 0
+    try:
+        authenticated = _is_authenticated(page)
+    except Exception as error:
+        authenticated = False
+        auth_error = str(error)
+    else:
+        auth_error = ""
+
+    for coin in coins:
+        key = coin.url.rstrip("/").lower()
+        record = {
+            "coin_url": coin.url,
+            "display_name": coin.label(),
+            "symbol": coin.symbol,
+        }
+        if key in seen_urls:
+            record["status"] = "duplicate_input"
+            results.append(record)
+            continue
+        seen_urls.add(key)
+        if not authenticated:
+            record["status"] = "login_required"
+            if auth_error:
+                record["error"] = auth_error
+            results.append(record)
+            continue
+        if coin.portfolio == "active":
+            record["status"] = "already_active"
+            results.append(record)
             continue
 
-        authenticated = _is_authenticated(page)
-        for coin in group:
-            record = {
-                "coin_url": coin.url,
-                "display_name": coin.label(),
-                "symbol": coin.symbol,
-                "portfolio_folder": portfolio_folder_number(folder_cursor),
-            }
-            if not authenticated:
-                record["status"] = "login_required"
-                results.append(record)
-                folder_cursor += 1
-                continue
-            if coin.portfolio == "active":
+        try:
+            picker_state = _open_coin_portfolio_picker(page, coin)
+            if picker_state == "active":
                 record["status"] = "already_active"
                 results.append(record)
-                folder_cursor += 1
                 continue
-            try:
-                if is_tokenized_stock_name(coin.name, coin.symbol):
-                    outcome = page.evaluate(_FAVORITE_CLICK_JS, coin.url, record["portfolio_folder"], True)
-                else:
-                    outcome = page.evaluate(_FAVORITE_CLICK_JS, coin.url, record["portfolio_folder"])
-                if not outcome.get("found"):
-                    record["status"] = "row_not_found"
-                elif not outcome.get("star"):
-                    record["status"] = "star_not_found"
-                elif outcome.get("active"):
-                    record["status"] = "already_active"
-                elif outcome.get("clicked"):
-                    page.wait_for_function(_FAVORITE_STATE_JS, arg=coin.url, timeout=12_000)
+            if picker_state == "unknown":
+                record["status"] = "portfolio_state_unconfirmed"
+                results.append(record)
+                continue
+            if picker_state == "picker_timeout":
+                record["status"] = "portfolio_picker_timeout"
+                results.append(record)
+                continue
+
+            if latest_folder is None:
+                options = _portfolio_options(page)
+                if not options:
+                    record["status"] = "portfolio_folder_not_found"
+                    results.append(record)
+                    continue
+                latest_folder = max(options, key=lambda option: int(option["number"]))
+                assets = _portfolio_asset_urls(page, str(latest_folder["href"]))
+                folder_count = len(assets)
+                picker_state = _open_coin_portfolio_picker(page, coin)
+                if picker_state != "opened":
+                    record["status"] = (
+                        "already_active"
+                        if picker_state == "active"
+                        else "portfolio_picker_timeout"
+                        if picker_state == "picker_timeout"
+                        else "portfolio_state_unconfirmed"
+                    )
+                    results.append(record)
+                    continue
+
+            if folder_count >= PORTFOLIO_FOLDER_SIZE:
+                next_number = int(latest_folder["number"]) + 1
+                created = _create_portfolio(page, next_number)
+                if created is None:
+                    record["status"] = "portfolio_creation_failed"
+                    results.append(record)
+                    continue
+                latest_folder = created
+                folder_count = 0
+                picker_state = _open_coin_portfolio_picker(page, coin)
+                if picker_state == "active":
+                    record["portfolio_folder"] = next_number
                     record["status"] = "added"
-                else:
-                    record["status"] = "unknown"
-            except PlaywrightTimeoutError:
-                record["status"] = (
-                    "login_required" if not _is_authenticated(page) else "verification_failed"
-                )
-            except Exception as error:
-                record["status"] = f"failed:{type(error).__name__}"
-            results.append(record)
-            folder_cursor += 1
-            page.wait_for_timeout(400)
+                    folder_count += 1
+                    results.append(record)
+                    continue
+                if picker_state != "opened":
+                    record["status"] = (
+                        "portfolio_picker_timeout"
+                        if picker_state == "picker_timeout"
+                        else "portfolio_state_unconfirmed"
+                    )
+                    results.append(record)
+                    continue
+
+            folder_number = int(latest_folder["number"])
+            record["portfolio_folder"] = folder_number
+            add_outcome = _click_portfolio_row_plus(page, folder_number)
+            if not add_outcome.get("found") or not add_outcome.get("clicked"):
+                record["status"] = add_outcome.get("reason", "portfolio_add_control_not_found")
+                results.append(record)
+                continue
+            if not add_outcome.get("verified"):
+                record["status"] = "verification_failed"
+                results.append(record)
+                continue
+            record["status"] = "added"
+            folder_count += 1
+        except PlaywrightTimeoutError:
+            record["status"] = (
+                "login_required" if not _is_authenticated(page) else "verification_failed"
+            )
+        except Exception as error:
+            record["status"] = f"failed:{type(error).__name__}"
+            record["error"] = str(error)
+            print(
+                f"즐겨찾기 처리 실패: {coin.label()} "
+                f"({type(error).__name__}: {error})"
+            )
+        results.append(record)
+        print(f"즐겨찾기 처리 결과: {record['status']} - {coin.label()}")
     return results
 
 
@@ -1125,26 +1260,30 @@ def chrome_debug_endpoint(browser: str = "chrome", user_data_dir: str | None = N
     return read_devtools_active_port(directory)
 
 
+def _browser_session_endpoint(args: argparse.Namespace) -> str | None:
+    """Prefer the live browser unless a dedicated profile was explicitly selected."""
+    explicit_endpoint = getattr(args, "cdp_url", None)
+    if explicit_endpoint:
+        return explicit_endpoint
+    if getattr(args, "attach", False) or not getattr(args, "profile", None):
+        return chrome_debug_endpoint(
+            args.browser, getattr(args, "chrome_user_data", None)
+        )
+    return None
+
+
 def _open_browser_session(
     playwright, args: argparse.Namespace
 ) -> tuple[object | None, BrowserContext, Page, bool]:
     """Return (browser, context, page, owns_context).
 
-    ``--attach`` attaches to the user's already-running Chrome through the
-    DevToolsActivePort file. It does not copy cookies or launch a second
-    profile. The caller must close only the page, never the context/browser.
+    The live browser is preferred when its DevToolsActivePort file is available.
+    An explicit ``--profile`` selects the isolated persistent-profile flow.
+    The caller must close only the page, never an attached context/browser.
     """
-    if getattr(args, "attach", False) or getattr(args, "cdp_url", None):
-        endpoint = getattr(args, "cdp_url", None) or chrome_debug_endpoint(
-            args.browser, getattr(args, "chrome_user_data", None)
-        )
-        if not endpoint:
-            raise RuntimeError(
-                "실사용 브라우저의 원격 디버깅이 꺼져 있습니다. "
-                "주소창에 chrome://inspect/#remote-debugging 을 열고 "
-                "'Allow remote debugging for this browser instance'를 켠 뒤 다시 실행하세요."
-            )
-        print("실사용 브라우저에 연결합니다. 브라우저에 승인 창이 뜨면 '허용'을 눌러주세요.")
+    endpoint = _browser_session_endpoint(args)
+    if endpoint:
+        print("실사용 브라우저의 원격 디버깅 세션에 연결합니다.")
         browser = playwright.chromium.connect_over_cdp(endpoint, timeout=90_000)
         contexts = browser.contexts or [browser.new_context()]
         # Chrome can expose one context per profile. Prefer the profile that
@@ -1159,6 +1298,16 @@ def _open_browser_session(
                 continue
         page = context.new_page()
         return browser, context, page, False
+    if getattr(args, "attach", False) or getattr(args, "cdp_url", None):
+        endpoint = getattr(args, "cdp_url", None) or chrome_debug_endpoint(
+            args.browser, getattr(args, "chrome_user_data", None)
+        )
+        if not endpoint:
+            raise RuntimeError(
+                "실사용 브라우저의 원격 디버깅이 꺼져 있습니다. "
+                "주소창에 chrome://inspect/#remote-debugging 을 열고 "
+                "'Allow remote debugging for this browser instance'를 켠 뒤 다시 실행하세요."
+            )
 
     profile = (
         Path(args.profile).expanduser().resolve()
@@ -1238,10 +1387,45 @@ def _coin_details(
     )
 
 
+def _prepare_page_for_capture(page: Page, *, min_wait_ms: int = 1200, max_scroll_rounds: int = 12) -> None:
+    """Fully load a scroll-responsive page before taking a full-page screenshot."""
+    if not hasattr(page, "evaluate") and not hasattr(page, "wait_for_timeout"):
+        return
+    try:
+        if not hasattr(page, "evaluate"):
+            if hasattr(page, "wait_for_timeout"):
+                page.wait_for_timeout(min_wait_ms)
+            return
+
+        previous_height = -1
+        stable_rounds = 0
+        for _ in range(max_scroll_rounds):
+            height = page.evaluate("document.documentElement.scrollHeight")
+            page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+            if hasattr(page, "wait_for_timeout"):
+                page.wait_for_timeout(max(300, min_wait_ms // 6))
+            next_height = page.evaluate("document.documentElement.scrollHeight")
+            if next_height == height == previous_height:
+                stable_rounds += 1
+                if stable_rounds >= 2:
+                    break
+            else:
+                stable_rounds = 0
+            previous_height = next_height
+
+        page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+        if hasattr(page, "wait_for_timeout"):
+            page.wait_for_timeout(min_wait_ms)
+    except Exception:
+        if hasattr(page, "wait_for_timeout"):
+            page.wait_for_timeout(min_wait_ms)
+
+
 def _save_full_page_screenshot(page: Page, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.stem + ".part" + target.suffix)
     try:
+        _prepare_page_for_capture(page)
         retry(lambda: page.screenshot(path=str(temporary), full_page=True, timeout=90_000))
         os.replace(temporary, target)
     finally:
@@ -1453,16 +1637,6 @@ def _capture_coin(
                     if response and response.status >= 400:
                         raise ValueError(f"whitepaper_http_{response.status}")
                     _load_lazy_content(page)
-                    screenshot = output_path(
-                        pdf_dir,
-                        coin.name,
-                        coin.url,
-                        "-whitepaper.png",
-                        coin.symbol,
-                        duplicate_index=getattr(coin, "duplicate_index", 1),
-                    )
-                    _save_full_page_screenshot(page, screenshot)
-                    details["whitepaper_screenshot"] = str(screenshot.relative_to(output_root))
                     rendered_pdf = output_path(
                         pdf_dir,
                         coin.name,
@@ -1472,6 +1646,7 @@ def _capture_coin(
                         duplicate_index=getattr(coin, "duplicate_index", 1),
                     )
                     retry(lambda: _save_page_as_pdf(page, rendered_pdf))
+                    pending_site = None
                     details["pdf"] = str(rendered_pdf.relative_to(output_root))
                     details["whitepaper_result"] = "rendered_pdf"
                 except AccessWallError:
@@ -1565,7 +1740,8 @@ def run(args: argparse.Namespace) -> int:
     all_coins: list[Coin] = []
     selected_urls: set[str] | None = _load_selection(args.selection_json)
     missing_selection: list[str] = []
-    attached = bool(args.attach or args.cdp_url)
+    endpoint = _browser_session_endpoint(args)
+    attached = bool(endpoint)
     result: dict = {
         "version": 1,
         "mode": args.mode,
@@ -1574,8 +1750,7 @@ def run(args: argparse.Namespace) -> int:
         "browser": {
             "mode": "attach" if attached else "profile",
             "browser": args.browser,
-            "endpoint": args.cdp_url
-            or (chrome_debug_endpoint(args.browser, args.chrome_user_data) if attached else None),
+            "endpoint": endpoint,
             "profile": None if attached else str(profile),
         },
         "pages": args.pages,
@@ -1598,15 +1773,27 @@ def run(args: argparse.Namespace) -> int:
                 ) from error
             raise
         try:
+            if not attached:
+                print(
+                    "실사용 Chrome 디버깅 주소를 찾지 못해 전용 브라우저 프로필을 사용합니다. "
+                    "이 프로필은 평소 Chrome 로그인과 공유되지 않습니다."
+                )
             for number in range(1, args.pages + 1):
                 try:
                     coins = retry(lambda: _listing_page(page, number))
                 except AccessWallError:
                     raise
                 except Exception as error:
-                    print(f"페이지 {number}: 읽기 실패 ({type(error).__name__}); 다음 실행에서 재시도합니다.")
+                    print(
+                        f"페이지 {number}: 읽기 실패 "
+                        f"({type(error).__name__}: {error}); 다음 실행에서 재시도합니다."
+                    )
                     result["errors"].append(
-                        {"page": number, "error": type(error).__name__}
+                        {
+                            "page": number,
+                            "error": type(error).__name__,
+                            "message": str(error),
+                        }
                     )
                     manifest["pages"] = [
                         entry for entry in manifest["pages"] if entry.get("page") != number
@@ -1645,15 +1832,16 @@ def run(args: argparse.Namespace) -> int:
 
             all_coins = deduplicate_coins(all_coins)
             before_filter = len(all_coins)
-            all_coins = sorted(
-                (coin for coin in all_coins if age_within_days(coin.added, args.since_days)),
-                key=_recent_sort_key,
-            )
+            if args.since_days:
+                all_coins = [
+                    coin for coin in all_coins if age_within_days(coin.added, args.since_days)
+                ]
+                age_summary = f"최근 {args.since_days}일 날짜 판독 가능 항목"
+            else:
+                age_summary = "요청 페이지 전체 항목"
+            all_coins = sorted(all_coins, key=_recent_sort_key)
             all_coins = assign_duplicate_indices(all_coins)
-            print(
-                f"최근 {args.since_days}일 날짜 판독 가능 항목: "
-                f"{len(all_coins)}개 / {before_filter}개"
-            )
+            print(f"{age_summary}: {len(all_coins)}개 / {before_filter}개")
             print(f"중복 제거 후 총 {len(all_coins)}개 코인")
             for coin in all_coins:
                 print(
@@ -1721,8 +1909,20 @@ def run(args: argparse.Namespace) -> int:
                     _save_manifest(manifest_path, manifest)
                     added = sum(1 for item in auto_favorite_results if item["status"] == "added")
                     print(f"원클릭 수집 전 자동 즐겨찾기: {added}개 추가 / 처리 {len(auto_favorite_results)}개")
+                auto_added_urls = {
+                    item["coin_url"].rstrip("/").lower()
+                    for item in auto_favorite_results
+                    if isinstance(item, dict)
+                    and item.get("status") == "added"
+                    and item.get("coin_url")
+                }
                 for coin in selected:
-                    if not _capture_allowed(coin, args.include_unstarred):
+                    if is_tokenized_stock_name(coin.name, coin.symbol):
+                        print(f"즐겨찾기 전용 처리(Tokenized Stock): {coin.label()}")
+                        continue
+                    auto_added = coin.url.rstrip("/").lower() in auto_added_urls
+                    if not _capture_allowed(coin, args.include_unstarred, auto_added=auto_added):
+                        print(f"건너뜀(새 즐겨찾기 추가 확인 안 됨): {coin.label()}")
                         if coin.portfolio == "unknown":
                             existing = manifest["coins"].get(coin.url, {})
                             existing.update(
@@ -1786,7 +1986,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Fail-closed CoinGecko portfolio coin archiver")
     parser.add_argument("--mode", choices=("dry-run", "capture", "favorites"), default="dry-run")
     parser.add_argument("--pages", type=int, default=10)
-    parser.add_argument("--since-days", type=int, default=1)
+    parser.add_argument(
+        "--since-days",
+        type=int,
+        default=0,
+        help="Filter rows by listing age in days; 0 includes every row from the requested pages.",
+    )
     parser.add_argument("--browser", choices=("chrome", "edge"), default="chrome")
     parser.add_argument("--profile")
     parser.add_argument("--output-dir")
@@ -1794,7 +1999,7 @@ def main() -> int:
     parser.add_argument(
         "--attach",
         action="store_true",
-        help="Attach to the running browser through chrome://inspect remote debugging.",
+        help="Require attachment to the running browser through chrome://inspect remote debugging.",
     )
     parser.add_argument("--cdp-url", help="Explicit CDP WebSocket URL for --attach.")
     parser.add_argument(
@@ -1822,8 +2027,8 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.pages <= 10:
         parser.error("--pages must be between 1 and 10")
-    if not 1 <= args.since_days <= 30:
-        parser.error("--since-days must be between 1 and 30")
+    if not 0 <= args.since_days <= 30:
+        parser.error("--since-days must be between 0 and 30")
     if args.selection_json and not Path(args.selection_json).expanduser().exists():
         parser.error("--selection-json file does not exist")
     try:

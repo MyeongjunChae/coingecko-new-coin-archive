@@ -28,7 +28,7 @@ pip install -r requirements-dev.txt
 2. 주소창에 `chrome://inspect/#remote-debugging`을 입력합니다.
 3. **Allow remote debugging for this browser instance**를 켭니다.
 4. `run_web.cmd`를 더블클릭합니다. 웹 페이지가 자동으로 열립니다.
-5. **목록 새로고침**을 누릅니다. Chrome에 승인 창이 뜨면 **허용**을 누릅니다.
+5. **목록 새로고침**을 누릅니다. Allow 설정이 이미 켜져 있으면 별도 승인 팝업 없이 연결될 수 있습니다.
 6. 목록에서 코인을 고르거나 전체 선택한 뒤 **원클릭 수집** / **선택 즐겨찾기 추가**를 누릅니다.
 7. **CSV** 또는 **ZIP 다운로드**로 결과를 받습니다.
 
@@ -45,11 +45,11 @@ Chrome 136 이후에는 기본 프로필 폴더로 `--remote-debugging-port`를 
 - 이미 로그인된 즐겨찾기(포트폴리오 별표) 상태를 그대로 읽습니다.
 - 즐겨찾기 추가도 같은 세션에서 수행합니다.
 
-프로그램은 Chrome이 남기는 `DevToolsActivePort` 파일을 읽어 로컬 CDP 주소로 연결합니다. 연결 시 Chrome 승인 창이 한 번 뜰 수 있습니다.
+프로그램은 Chrome이 남기는 `DevToolsActivePort` 파일을 읽어 로컬 CDP 주소로 연결합니다. Allow 설정이 이미 켜져 있으면 연결 시 별도 Chrome 승인 창이 뜨지 않을 수 있습니다.
 
 ### 연결 확인
 
-웹 페이지 상단에 **Chrome 연결 준비됨**이 표시되면 정상입니다. **Chrome 연결 필요**가 표시되면:
+웹 페이지 상단에 **Chrome 디버깅 포트 감지됨**이 표시되면 포트가 열려 있다는 뜻입니다. 실제 CDP 연결은 목록/수집 실행 시 확인됩니다. Allow 설정이 이미 켜져 있으면 별도 승인 팝업은 뜨지 않을 수 있습니다. **Chrome 연결 필요**가 표시되면:
 
 1. Chrome에서 `chrome://inspect/#remote-debugging`을 엽니다.
 2. **Allow remote debugging for this browser instance**를 켭니다.
@@ -62,10 +62,10 @@ Chrome 136 이후에는 기본 프로필 폴더로 `--remote-debugging-port`를 
 
 ### 목록 새로고침
 
-지정한 페이지 범위에서 등록 경과시간이 `최근 N일` 이내인 코인을 읽어 표시하고 `recent-coins-preview.csv`를 갱신합니다. 이 단계는 파일을 다운로드하거나 캡처하지 않습니다.
+지정한 페이지 범위의 코인을 모두 읽어 표시하고 `recent-coins-preview.csv`를 갱신합니다. 기본값은 페이지 전체이며, 필요하면 등록 기간을 최근 1~30일로 제한할 수 있습니다. 이 단계는 파일을 다운로드하거나 캡처하지 않습니다.
 
 - **페이지**: 1~10
-- **최근 N일**: 1~30
+- **등록 기간**: 페이지 전체(기본값) 또는 최근 1~30일
 - **별표 상태와 무관하게 모두 수집**: 로그인/별표 상태를 확인할 수 없어도 모든 코인을 처리합니다. 기본값은 꺼짐(실패 폐쇄)입니다.
 - **완료된 코인도 다시 수집**: 이미 완료된 항목도 강제로 다시 캡처합니다.
 
@@ -73,7 +73,7 @@ Chrome 136 이후에는 기본 프로필 폴더로 `--remote-debugging-port`를 
 
 목록에서 선택한 코인만 처리합니다. 아무것도 선택하지 않으면 현재 목록 전체를 처리합니다.
 
-기본 동작은 **실패 폐쇄**입니다. 별표가 명시적으로 활성인 코인만 캡처하고, 상태를 확신할 수 없으면 건너뛰고 `needs_review`로 기록합니다. `별표 상태와 무관하게 모두 수집`을 켜면 이 제한을 해제합니다.
+기본 동작은 미즐겨찾기 코인을 먼저 실제 포트폴리오에 추가한 뒤, **추가 확인에 성공한 코인만** 캡처하는 것입니다. 이미 즐겨찾기된 코인은 건너뛰며, 로그인·추가·확인에 실패한 코인도 캡처하지 않고 실행 로그에 실패 상태를 남깁니다. 이름에 `Tokenized`와 `Stock` 또는 `Share`가 포함된 항목은 즐겨찾기 추가만 하고 캡처/PDF 스캔은 건너뜁니다. `별표 상태와 무관하게 모두 수집`을 켜면 일반 코인의 캡처 제한을 해제합니다.
 
 코인마다 다음 순서로 저장합니다.
 
@@ -83,16 +83,20 @@ Chrome 136 이후에는 기본 프로필 폴더로 `--remote-debugging-port`를 
 4. 백서가 실제 PDF면 원본 PDF 저장
 5. GitBook 같은 웹 백서면 전체 PNG + 브라우저 인쇄 PDF 저장
 
-완료된 코인은 다음 실행에서 건너뜁니다. `완료된 코인도 다시 수집`을 켜면 다시 처리합니다.
+완료된 코인은 다음 실행에서 건너뜁니다. `완료된 코인도 다시 수집`을 켜면 다시 처리합니다. CLI에서는 `--since-days 0`이 요청한 페이지 전체를 뜻합니다.
 
 ### 선택 즐겨찾기 추가
 
-목록에서 코인을 선택한 뒤 버튼을 누릅니다. CoinGecko의 별표를 실제로 클릭하고, 별표가 활성 상태로 바뀌었는지 다시 확인합니다.
+목록에서 코인을 선택한 뒤 버튼을 누릅니다. 각 코인의 상세 페이지에서 `Add to Portfolio`를 열고, 가장 최신 포트폴리오 행의 `+`를 눌러 추가한 뒤 별표 활성 상태를 확인합니다. 이미 포트폴리오에 있는 코인은 다시 추가하지 않습니다.
+
+가장 최신 포트폴리오의 실제 보유 코인 수를 확인합니다. 최대 1,000개까지는 해당 폴더를 사용하고, 가득 찼으면 `Add to New Portfolio`로 다음 번호의 폴더를 만들어 사용합니다(예: `16` 다음은 `17`). 폴더 행의 `+` 컨트롤을 찾거나 추가 후 상태를 검증할 수 없으면 성공으로 처리하지 않고 검토 상태로 남깁니다. `Tokenized Stock`/`Tokenized Share` 이름의 항목은 포트폴리오에 추가하되 사이트 캡처와 백서/PDF 수집은 건너뜁니다.
 
 - 이미 활성: `already_active`
 - 추가 성공: `added`
 - 로그인 필요: `login_required`
-- 행/별표를 찾지 못함: `row_not_found`, `star_not_found`
+- 상태를 확인하지 못함: `portfolio_state_unconfirmed`
+- 폴더/`+`를 찾지 못함: `portfolio_folder_not_found`, `portfolio_row_plus_not_found`
+- 새 포트폴리오 생성 실패: `portfolio_creation_failed`
 - 확인 실패: `verification_failed`
 
 실패한 항목은 성공으로 추정하지 않고 매니페스트와 결과 JSON에 그대로 기록합니다.
@@ -150,7 +154,7 @@ python web_app.py --output-dir "D:\내 아카이브"
 
 ## 고급: CLI로 실행
 
-웹 UI 없이 명령줄로도 실행할 수 있습니다. 실사용 Chrome에 연결하려면 `--attach`를 사용합니다.
+웹 UI 없이 명령줄로도 실행할 수 있습니다. `--profile`을 지정하지 않으면 사용할 수 있는 실사용 Chrome 디버깅 주소를 자동 감지해 연결합니다. `--attach`는 실사용 Chrome 연결을 필수로 요구하며, 디버깅 주소가 없으면 전용 프로필로 조용히 넘어가지 않고 오류를 냅니다. 이 스크립트의 기본 모드는 파일을 저장하지 않는 `dry-run`입니다. 실제 수집은 `--mode capture`를 명시해야 합니다.
 
 ```powershell
 $output = "C:\Users\onlya\OneDrive\Desktop\CoinGecko Archive"
@@ -188,14 +192,14 @@ python .\coingecko_archive.py --mode favorites --pages 10 --since-days 1 `
 python .\coingecko_archive.py --setup-profile
 ```
 
-열린 전용 브라우저 창에서 직접 로그인한 뒤 **그 창만** 닫고, `--attach` 없이 실행합니다. 웹 UI는 항상 실사용 Chrome 연결을 사용합니다.
+열린 전용 브라우저 창에서 직접 로그인한 뒤, 해당 프로필을 `--profile`로 지정해 실행합니다. `--profile`을 지정하지 않으면 사용 가능한 실사용 Chrome 세션에 자동 연결합니다. 웹 UI는 실사용 Chrome 연결을 요구합니다.
 
 ## 문제 해결
 
 | 증상 | 확인 |
 | --- | --- |
 | `Chrome 연결 필요` | `chrome://inspect/#remote-debugging`에서 허용을 켜고 다시 시도 |
-| 승인 창이 안 뜸 | Chrome을 완전히 종료 후 재실행, 원격 디버깅 다시 허용 |
+| 승인 팝업이 안 뜸 | Allow가 이미 켜져 있으면 정상일 수 있습니다. 실행 로그의 연결 모드와 실제 CDP 연결 결과를 확인 |
 | `login_required` | 연결된 Chrome에서 CoinGecko에 로그인되어 있는지 확인 |
 | `ProcessSingleton` | 전용 프로필 브라우저 창이 열려 있음. 그 창만 닫기 |
 | 이미 실행 중 | 웹 UI 작업이 끝날 때까지 기다리거나 **실행 중지** |

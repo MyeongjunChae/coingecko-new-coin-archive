@@ -341,6 +341,7 @@ def _command(
 ) -> list[str]:
     command = [
         sys.executable,
+        "-u",
         str(BASE_DIR / "coingecko_archive.py"),
         "--mode",
         mode,
@@ -368,7 +369,7 @@ def _command(
 
 def _validate(body: dict) -> tuple[int, int, str, bool, bool, bool, list[str] | None]:
     pages = int(body.get("pages", 10))
-    since_days = int(body.get("since_days", 1))
+    since_days = int(body.get("since_days", 0))
     browser = str(body.get("browser", "chrome"))
     attach = bool(body.get("attach", True))
     include_unstarred = bool(body.get("include_unstarred", False))
@@ -376,8 +377,8 @@ def _validate(body: dict) -> tuple[int, int, str, bool, bool, bool, list[str] | 
     urls = body.get("urls")
     if not 1 <= pages <= 10:
         raise ValueError("페이지 수는 1~10 사이여야 합니다.")
-    if not 1 <= since_days <= 30:
-        raise ValueError("최근 일수는 1~30 사이여야 합니다.")
+    if not 0 <= since_days <= 30:
+        raise ValueError("기간은 요청 페이지 전체 또는 최근 1~30일이어야 합니다.")
     if browser not in {"chrome", "edge"}:
         raise ValueError("브라우저는 chrome 또는 edge만 지원합니다.")
     if urls is not None:
@@ -797,7 +798,7 @@ INDEX_HTML = r"""<!doctype html>
     <ol class="steps">
       <li>열린 Chrome 탭에서 <code>chrome://inspect/#remote-debugging</code> 주소로 이동합니다.</li>
       <li><b>Allow remote debugging for this browser instance</b>를 켭니다.</li>
-      <li>이 페이지로 돌아와 <b>목록 새로고침</b>을 누르고, Chrome 승인 창이 뜨면 <b>허용</b>을 누릅니다.</li>
+      <li>이 페이지로 돌아와 <b>목록 새로고침</b>을 누릅니다. Allow를 이미 켰다면 별도 승인 팝업은 뜨지 않을 수 있습니다.</li>
     </ol>
     <p class="small" style="margin:10px 0 0">로그인/즐겨찾기 세션을 그대로 사용합니다. 쿠키를 복사하거나 별도 프로필에 로그인하지 않습니다. 사용이 끝나면 같은 설정을 꺼두세요.</p>
   </section>
@@ -805,7 +806,7 @@ INDEX_HTML = r"""<!doctype html>
   <section class="card">
     <div class="row">
       <label>페이지 <select id="pages"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option selected>10</option></select></label>
-      <label>최근 <select id="sinceDays"><option>1</option><option>3</option><option>7</option><option>14</option><option>30</option></select>일</label>
+      <label>등록 기간 <select id="sinceDays"><option value="0" selected>페이지 전체</option><option value="1">1일</option><option value="3">3일</option><option value="7">7일</option><option value="14">14일</option><option value="30">30일</option></select></label>
       <label class="small"><input type="checkbox" id="includeUnstarred"> 별표 상태와 무관하게 모두 수집</label>
       <label class="small"><input type="checkbox" id="force"> 완료된 코인도 다시 수집</label>
     </div>
@@ -875,7 +876,7 @@ function setPill(id, text, kind) {
 function renderChrome(chrome) {
   state.chrome = chrome;
   const ready = chrome && chrome.remote_debugging_enabled && chrome.reachable;
-  setPill("chromePill", ready ? "Chrome 연결 준비됨" : "Chrome 연결 필요", ready ? "ok" : "warn");
+  setPill("chromePill", ready ? "Chrome 디버깅 포트 감지됨" : "Chrome 연결 필요", ready ? "ok" : "warn");
   $("setupCard").classList.toggle("hidden", !!ready);
 }
 
@@ -1013,7 +1014,7 @@ async function startJob(path, body) {
   try {
     const data = await api(path, { method: "POST", body: JSON.stringify(body) });
     renderJob(data.job);
-    toast("작업을 시작했습니다. Chrome 승인 창이 뜨면 허용을 눌러주세요.", "ok");
+    toast("작업을 시작했습니다. 로그에서 실사용 Chrome 연결 상태를 확인하세요.", "ok");
     startPolling();
   } catch (error) {
     toast(error.message, "error");

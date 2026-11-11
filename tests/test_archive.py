@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import coingecko_archive as archive
+import web_app as web
 from coingecko_archive import (
     Coin,
     _browser_executable,
@@ -32,9 +33,15 @@ from coingecko_archive import (
     _capture_coin,
     _auto_add_inactive_coins,
     is_tokenized_stock_name,
-    portfolio_folder_number,
     sanitize_filename,
 )
+
+
+def test_web_app_defaults_to_all_rows_from_selected_pages():
+    pages, since_days, *_ = web._validate({})
+
+    assert pages == 10
+    assert since_days == 0
 
 
 def test_browser_resolution_selects_explicit_chrome_or_edge(tmp_path, monkeypatch):
@@ -144,11 +151,14 @@ def test_coingecko_star_icons_and_recent_age_are_parsed_from_rows():
     ]
 
 
-def test_capture_allowed_targets_unstarred_items_by_default_and_all_when_explicitly_requested():
-    assert _capture_allowed(Coin("Inactive", "https://example.com/inactive", "inactive", 1), False)
-    assert _capture_allowed(Coin("Unknown", "https://example.com/unknown", "unknown", 1), False)
+def test_capture_allowed_requires_successful_addition_by_default():
+    inactive = Coin("Inactive", "https://example.com/inactive", "inactive", 1)
+    unknown = Coin("Unknown", "https://example.com/unknown", "unknown", 1)
+    assert not _capture_allowed(inactive, False)
+    assert not _capture_allowed(unknown, False)
+    assert _capture_allowed(inactive, False, auto_added=True)
     assert not _capture_allowed(Coin("Already Active", "https://example.com/active", "active", 1), False)
-    assert _capture_allowed(Coin("Already Active", "https://example.com/active", "active", 1), True)
+    assert all(_capture_allowed(coin, True) for coin in (inactive, unknown))
 
 
 def test_recent_age_filter_is_conservative_for_unknown_and_seven_day_boundary():
@@ -400,9 +410,19 @@ def test_capture_targets_unstarred_coins_by_default_and_all_when_explicitly_requ
     unknown = Coin("Unknown", "https://example.com/unknown", "unknown", 1)
 
     assert not _capture_allowed(active, include_unstarred=False)
-    assert _capture_allowed(inactive, include_unstarred=False)
-    assert _capture_allowed(unknown, include_unstarred=False)
+    assert not _capture_allowed(inactive, include_unstarred=False)
+    assert not _capture_allowed(unknown, include_unstarred=False)
+    assert _capture_allowed(inactive, include_unstarred=False, auto_added=True)
+    assert _capture_allowed(active, include_unstarred=False, auto_added=True)
     assert all(_capture_allowed(coin, include_unstarred=True) for coin in (active, inactive, unknown))
+    tokenized = Coin(
+        "Example Tokenized Stock",
+        "https://example.com/tokenized",
+        "inactive",
+        1,
+        symbol="ETS",
+    )
+    assert not _capture_allowed(tokenized, include_unstarred=True, auto_added=True)
 
 
 def test_full_page_screenshot_saves_atomically_and_cleans_temporary_file(tmp_path):
@@ -567,15 +587,448 @@ def test_output_path_includes_duplicate_suffix_for_same_name_entries(tmp_path):
     assert "example-2" in target.name
 
 
-def test_tokenized_stock_names_bypass_portfolio_prompt_and_folder_rollover_starts_from_latest_folder():
+def test_whitepaper_fallback_keeps_only_pdf_artifact(tmp_path, monkeypatch):
+    class FakeSession:
+        def send(self, method, options):
+            content = b"%PDF-1.7\n1 0 obj << /Type /Page >> endobj\n%%EOF"
+            return {"data": base64.b64encode(content).decode("ascii")}
+
+        def detach(self):
+            pass
+
+    class FakeContext:
+        def new_cdp_session(self, page):
+            return FakeSession()
+
+    class FakePage:
+        context = FakeContext()
+
+    monkeypatch.setattr(
+        archive,
+        "_coin_details",
+        lambda page, coin: (
+            coin.name,
+            "https://example.com",
+            "ok",
+            "https://example.com/doc",
+            "ok",
+            None,
+            "missing",
+            [],
+        ),
+    )
+    monkeypatch.setattr(archive, "_navigate", lambda page, url: SimpleNamespace(status=200))
+    monkeypatch.setattr(archive, "_load_lazy_content", lambda page: None)
+    monkeypatch.setattr(archive, "_download_pdf", lambda url, target: (False, "not_pdf:text/html"))
+
+    def fake_render(page, target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n%%EOF")
+
+    monkeypatch.setattr(archive, "_save_page_as_pdf", fake_render)
+
+    details, pending = archive._capture_coin(
+        FakePage(),
+        Coin("Example", "https://coingecko.com/en/coins/example", "unknown", 1),
+        tmp_path / "screenshots",
+        tmp_path / "whitepapers",
+        tmp_path,
+    )
+
+    assert pending is None
+    assert "whitepaper_screenshot" not in details
+    assert details["pdf"].endswith("-whitepaper.pdf")
+    assert not (tmp_path / "whitepapers" / "Example-whitepaper.png").exists()
+
+
+def test_tokenized_stock_names_are_recognized_for_favorites_only_handling():
     assert is_tokenized_stock_name("Tokenized Stock", "TST")
     assert is_tokenized_stock_name("bStocks Tokenized Stock", "BST")
     assert not is_tokenized_stock_name("Example Coin", "EX")
-    assert portfolio_folder_number(1) == 16
-    assert portfolio_folder_number(1000) == 16
-    assert portfolio_folder_number(1001) == 17
-    assert portfolio_folder_number(2000) == 17
-    assert portfolio_folder_number(2001) == 18
+
+
+def test_add_coins_to_favorites_uses_latest_portfolio_and_skips_duplicate_inputs(monkeypatch):
+    coins = [
+        Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1, "1 hour", "EX"),
+        Coin(
+            "Example Tokenized Stock",
+            "https://www.coingecko.com/en/coins/example-tokenized-stock",
+            "inactive",
+            1,
+            "1 hour",
+            "ETS",
+        ),
+        Coin("Already Saved", "https://www.coingecko.com/en/coins/already-saved", "active", 1),
+        Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1, "1 hour", "EX"),
+    ]
+    opened = []
+    selected_folders = []
+    monkeypatch.setattr(archive, "_navigate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(archive, "_is_authenticated", lambda _page: True)
+    monkeypatch.setattr(
+        archive,
+        "_open_coin_portfolio_picker",
+        lambda _page, coin: opened.append(coin.url) or "opened",
+    )
+    monkeypatch.setattr(
+        archive,
+        "_portfolio_options",
+        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐ 16"}],
+    )
+    monkeypatch.setattr(archive, "_portfolio_asset_urls", lambda *_args: set())
+    monkeypatch.setattr(
+        archive,
+        "_click_portfolio_row_plus",
+        lambda _page, number: selected_folders.append(number)
+        or {"found": True, "clicked": True, "verified": True},
+    )
+    monkeypatch.setattr(archive, "_coin_detail_portfolio_state", lambda _page: "active")
+
+    page = SimpleNamespace()
+    results = archive.add_coins_to_favorites(page, coins)
+
+    assert [result["status"] for result in results] == [
+        "added",
+        "added",
+        "already_active",
+        "duplicate_input",
+    ]
+    assert [result.get("portfolio_folder") for result in results] == [16, 16, None, None]
+    assert opened == [coins[0].url, coins[0].url, coins[1].url]
+    assert selected_folders == [16, 16]
+
+
+def test_add_coins_to_favorites_creates_next_portfolio_when_latest_is_full(monkeypatch):
+    coin = Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1, symbol="EX")
+    selected_folders = []
+    created = []
+    monkeypatch.setattr(archive, "_navigate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(archive, "_is_authenticated", lambda _page: True)
+    monkeypatch.setattr(archive, "_open_coin_portfolio_picker", lambda *_args: "opened")
+    monkeypatch.setattr(
+        archive,
+        "_portfolio_options",
+        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐ 16"}],
+    )
+    monkeypatch.setattr(archive, "_portfolio_asset_urls", lambda *_args: {f"/en/coins/coin-{n}" for n in range(1000)})
+    monkeypatch.setattr(
+        archive,
+        "_create_portfolio",
+        lambda _page, number: created.append(number)
+        or {"number": number, "href": f"/en/portfolios/{number}", "label": str(number)},
+    )
+    monkeypatch.setattr(
+        archive,
+        "_click_portfolio_row_plus",
+        lambda _page, number: selected_folders.append(number)
+        or {"found": True, "clicked": True, "verified": True},
+    )
+    monkeypatch.setattr(archive, "_coin_detail_portfolio_state", lambda _page: "active")
+
+    results = archive.add_coins_to_favorites(SimpleNamespace(), [coin])
+
+    assert results[0]["status"] == "added"
+    assert results[0]["portfolio_folder"] == 17
+    assert created == [17]
+    assert selected_folders == [17]
+
+
+def test_add_coins_to_favorites_keeps_latest_portfolio_below_capacity(monkeypatch):
+    coin = Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1, symbol="EX")
+    selected_folders = []
+    monkeypatch.setattr(archive, "_navigate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(archive, "_is_authenticated", lambda _page: True)
+    monkeypatch.setattr(archive, "_open_coin_portfolio_picker", lambda *_args: "opened")
+    monkeypatch.setattr(
+        archive,
+        "_portfolio_options",
+        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐ 16"}],
+    )
+    monkeypatch.setattr(archive, "_portfolio_asset_urls", lambda *_args: {f"/en/coins/coin-{n}" for n in range(999)})
+    monkeypatch.setattr(
+        archive,
+        "_create_portfolio",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("portfolio 16 still has capacity")),
+    )
+    monkeypatch.setattr(
+        archive,
+        "_click_portfolio_row_plus",
+        lambda _page, number: selected_folders.append(number)
+        or {"found": True, "clicked": True, "verified": True},
+    )
+    monkeypatch.setattr(archive, "_coin_detail_portfolio_state", lambda _page: "active")
+
+    results = archive.add_coins_to_favorites(SimpleNamespace(), [coin])
+
+    assert results[0]["status"] == "added"
+    assert results[0]["portfolio_folder"] == 16
+    assert selected_folders == [16]
+
+
+def test_add_coins_to_favorites_never_clicks_when_portfolio_state_is_uncertain(monkeypatch):
+    coin = Coin("Unknown", "https://www.coingecko.com/en/coins/unknown", "unknown", 1)
+    monkeypatch.setattr(archive, "_navigate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(archive, "_is_authenticated", lambda _page: True)
+    monkeypatch.setattr(archive, "_open_coin_portfolio_picker", lambda *_args: "unknown")
+    monkeypatch.setattr(
+        archive,
+        "_click_portfolio_row_plus",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not add an uncertain coin")),
+    )
+
+    results = archive.add_coins_to_favorites(SimpleNamespace(), [coin])
+
+    assert results[0]["status"] == "portfolio_state_unconfirmed"
+
+
+def test_add_coins_to_favorites_requires_folder_check_after_click(monkeypatch):
+    coin = Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1)
+    monkeypatch.setattr(archive, "_navigate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(archive, "_is_authenticated", lambda _page: True)
+    monkeypatch.setattr(archive, "_open_coin_portfolio_picker", lambda *_args: "opened")
+    monkeypatch.setattr(
+        archive,
+        "_portfolio_options",
+        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐ 16"}],
+    )
+    monkeypatch.setattr(archive, "_portfolio_asset_urls", lambda *_args: set())
+    monkeypatch.setattr(
+        archive,
+        "_click_portfolio_row_plus",
+        lambda *_args: {"found": True, "clicked": True},
+    )
+
+    results = archive.add_coins_to_favorites(SimpleNamespace(), [coin])
+
+    assert results[0]["status"] == "verification_failed"
+
+
+def test_portfolio_folder_option_index_matches_exact_numeric_label():
+    labels = ["⭐ My Portfolio", "⭐ 2", "⭐ 6", "⭐ 16", "Portfolio 17"]
+
+    assert archive._portfolio_folder_option_index(labels, 16) == 3
+    assert archive._portfolio_folder_option_index(labels, 17) == 4
+    assert archive._portfolio_folder_option_index(labels, 1) is None
+    assert archive._portfolio_label_number("⭐ 16") == 16
+    assert archive._portfolio_label_number("Portfolio 17") == 17
+
+
+def test_click_portfolio_row_plus_targets_exact_numbered_detail_picker_row():
+    clicked = []
+
+    class Plus:
+        def count(self):
+            return 1
+
+        def click(self, **_kwargs):
+            clicked.append(self.folder_number)
+
+        def __init__(self, folder_number):
+            self.folder_number = folder_number
+
+    class Row:
+        def __init__(self, label, folder_number):
+            self.label = label
+            self.plus = Plus(folder_number)
+
+        def inner_text(self):
+            return self.label
+
+        def locator(self, selector):
+            if selector == "i.fa-plus":
+                return self.plus
+            assert selector == "i.fa-check"
+            return Check()
+
+    class Check:
+        def wait_for(self, **kwargs):
+            assert kwargs == {"state": "visible", "timeout": 10_000}
+
+    class Rows:
+        def __init__(self):
+            self.rows = [Row("⭐ 15", 15), Row("⭐ 16", 16)]
+
+        def count(self):
+            return len(self.rows)
+
+        def nth(self, index):
+            return self.rows[index]
+
+    class Dropdown:
+        def locator(self, selector):
+            assert selector == archive._PORTFOLIO_PICKER_ROW_SELECTOR
+            return Rows()
+
+    class Page:
+        def wait_for_selector(self, selector, **kwargs):
+            assert selector == archive._PORTFOLIO_PICKER_PLUS_SELECTOR
+            assert kwargs["state"] == "visible"
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+        def locator(self, selector):
+            assert selector == archive._DETAIL_PORTFOLIO_PICKER_SELECTOR
+            return Dropdown()
+
+    result = archive._click_portfolio_row_plus(Page(), 16)
+
+    assert result == {"found": True, "clicked": True, "verified": True}
+    assert clicked == [16]
+
+
+def test_create_portfolio_uses_detail_picker_new_portfolio_action(monkeypatch):
+    state = {"clicked": False, "name": None, "submitted": False}
+    expected_selector = (
+        f'{archive._DETAIL_PORTFOLIO_PICKER_SELECTOR} '
+        '[data-action*="coin-favorites#handleNewPortfolio"]'
+    )
+
+    class Submit:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def click(self, **_kwargs):
+            state["submitted"] = True
+
+    class Form:
+        def locator(self, selector):
+            assert selector == 'button[type="submit"], input[type="submit"]'
+            return Submit()
+
+    class NameInput:
+        def is_visible(self):
+            return True
+
+        def get_attribute(self, name):
+            return "name" if name == "name" else None
+
+        def fill(self, value):
+            state["name"] = value
+
+        def locator(self, selector):
+            assert selector == "xpath=ancestor::form"
+            return Form()
+
+    class Inputs:
+        def count(self):
+            return 1
+
+        def nth(self, _index):
+            return NameInput()
+
+    class CreateOption:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def click(self, **_kwargs):
+            state["clicked"] = True
+
+    class Page:
+        def locator(self, selector):
+            if selector == expected_selector:
+                return CreateOption()
+            if selector == "input":
+                return Inputs()
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    monkeypatch.setattr(
+        archive,
+        "_portfolio_options",
+        lambda _page: [{"number": 17, "href": "/en/portfolios/17", "label": "⭐ 17"}],
+    )
+
+    result = archive._create_portfolio(Page(), 17)
+
+    assert state == {"clicked": True, "name": "17", "submitted": True}
+    assert result == {"number": 17, "href": "/en/portfolios/17", "label": "⭐ 17"}
+
+
+def test_portfolio_asset_urls_counts_unique_assets_across_pages(monkeypatch):
+    class Link:
+        def __init__(self, href):
+            self.href = href
+
+        def get_attribute(self, _name):
+            return self.href
+
+        def is_visible(self):
+            return True
+
+    class Row:
+        def __init__(self, hrefs):
+            self.hrefs = hrefs
+
+        def locator(self, _selector):
+            return Links(self.hrefs)
+
+    class Links:
+        def __init__(self, hrefs):
+            self.hrefs = hrefs
+
+        def count(self):
+            return len(self.hrefs)
+
+        def nth(self, index):
+            return Link(self.hrefs[index])
+
+        def is_visible(self):
+            return True
+
+    class FakePage:
+        def __init__(self):
+            self.page_number = 1
+            self.url = "https://www.coingecko.com/en/portfolios/124912956"
+
+        def locator(self, selector):
+            if selector == "table tbody tr":
+                hrefs = (
+                    [["/en/coins/alpha"], ["/en/coins/beta"]]
+                    if self.page_number == 1
+                    else [["/en/coins/beta"], ["/en/coins/gamma"]]
+                )
+                return Rows([Row(row) for row in hrefs])
+            if selector == 'a[aria-label="next"], a[rel="next"]':
+                return Links(["/en/portfolios/124912956?page=2"] if self.page_number == 1 else [])
+            raise AssertionError(f"Unexpected selector: {selector}")
+
+    class Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def count(self):
+            return len(self.rows)
+
+        def nth(self, index):
+            return self.rows[index]
+
+    page = FakePage()
+
+    def fake_navigate(_page, url):
+        page.page_number = 2 if "page=2" in url else 1
+        page.url = url
+
+    monkeypatch.setattr(archive, "_navigate", fake_navigate)
+
+    assert archive._portfolio_asset_urls(page, "/en/portfolios/124912956") == {
+        "/en/coins/alpha",
+        "/en/coins/beta",
+        "/en/coins/gamma",
+    }
 
 
 def test_parse_listing_html_reads_toggle_state_from_aria_label_and_data_action():
@@ -610,6 +1063,28 @@ def test_auto_add_inactive_coins_promotes_to_active_before_capture(monkeypatch):
     assert results[0]["status"] == "added"
 
 
+def test_auto_add_inactive_coins_reports_login_required_without_clicking(monkeypatch):
+    coin = Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1, "1 hour", "EX")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("must not click while signed out")
+
+    monkeypatch.setattr(archive, "_is_authenticated", lambda _page: False)
+    monkeypatch.setattr(archive, "add_coins_to_favorites", fail_if_called)
+
+    refreshed, results = _auto_add_inactive_coins(SimpleNamespace(), [coin])
+
+    assert refreshed == [coin]
+    assert results == [
+        {
+            "coin_url": coin.url,
+            "display_name": coin.label(),
+            "symbol": coin.symbol,
+            "status": "login_required",
+        }
+    ]
+
+
 def test_devtools_active_port_parser_and_missing_file(tmp_path):
     assert read_devtools_active_port(tmp_path) is None
     path = tmp_path / "DevToolsActivePort"
@@ -617,6 +1092,37 @@ def test_devtools_active_port_parser_and_missing_file(tmp_path):
     assert read_devtools_active_port(tmp_path) == "ws://127.0.0.1:45678/devtools/browser/abc-def"
     path.write_text("not-a-port\n/devtools/browser/abc\n", encoding="utf-8")
     assert read_devtools_active_port(tmp_path) is None
+
+
+def test_browser_session_automatically_attaches_unless_profile_is_explicit(monkeypatch):
+    endpoint = "ws://127.0.0.1:9222/devtools/browser/example"
+    monkeypatch.setattr(archive, "chrome_debug_endpoint", lambda *_args, **_kwargs: endpoint)
+
+    automatic = SimpleNamespace(
+        browser="chrome",
+        profile=None,
+        attach=False,
+        cdp_url=None,
+        chrome_user_data=None,
+    )
+    dedicated = SimpleNamespace(
+        browser="chrome",
+        profile="C:/isolated/profile",
+        attach=False,
+        cdp_url=None,
+        chrome_user_data=None,
+    )
+    explicit = SimpleNamespace(
+        browser="chrome",
+        profile=None,
+        attach=False,
+        cdp_url="ws://127.0.0.1:9223/devtools/browser/explicit",
+        chrome_user_data=None,
+    )
+
+    assert archive._browser_session_endpoint(automatic) == endpoint
+    assert archive._browser_session_endpoint(dedicated) is None
+    assert archive._browser_session_endpoint(explicit) == explicit.cdp_url
 
 
 def test_selection_json_accepts_strings_or_coin_objects(tmp_path):
