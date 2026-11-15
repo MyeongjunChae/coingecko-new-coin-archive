@@ -31,6 +31,7 @@ from coingecko_archive import (
     _twitter_account_unavailable,
     _capture_coin,
     _auto_add_inactive_coins,
+    is_favorites_only_name,
     is_tokenized_stock_name,
     sanitize_filename,
 )
@@ -369,6 +370,65 @@ def test_capture_skips_deleted_twitter_and_uses_explorer(tmp_path, monkeypatch):
     assert visited == ["https://twitter.com/deleted", "https://etherscan.io/token/1"]
 
 
+def test_capture_records_external_access_blocks_and_tries_next_source(tmp_path, monkeypatch):
+    class FakePage:
+        def screenshot(self, *, path, full_page, timeout):
+            Path(path).write_bytes(b"png")
+
+    coin = Coin("Example", "https://coingecko.com/en/coins/example", "unknown", 1)
+    blocked_urls = {
+        "https://example.com",
+        "https://twitter.com/example",
+        "https://etherscan.io/token/1",
+    }
+    visited = []
+
+    monkeypatch.setattr(
+        archive,
+        "_coin_details",
+        lambda page, coin: (
+            coin.name,
+            "https://example.com",
+            "ok",
+            None,
+            "missing",
+            "https://twitter.com/example",
+            "ok",
+            ["https://etherscan.io/token/1", "https://arbiscan.io/token/2"],
+        ),
+    )
+
+    def navigate(page, url):
+        visited.append(url)
+        if url in blocked_urls:
+            raise archive.AccessWallError(f"HTTP 403 while opening {url}")
+        return SimpleNamespace(status=200)
+
+    monkeypatch.setattr(archive, "_navigate", navigate)
+
+    details, pending = _capture_coin(
+        FakePage(),
+        coin,
+        tmp_path / "screenshots",
+        tmp_path / "whitepapers",
+        tmp_path,
+    )
+
+    assert pending is None
+    assert details["status"] == "needs_review"
+    assert details["capture_source"] == "explorer"
+    assert details["explorer_screenshots"][0].endswith("-explorer.png")
+    assert details["review"].count("website_access_blocked") == 1
+    assert details["review"].count("twitter_access_blocked") == 1
+    assert details["review"].count("explorer_access_blocked") == 1
+    assert visited == [
+        "https://example.com",
+        "https://twitter.com/example",
+        "https://etherscan.io/token/1",
+        "https://arbiscan.io/token/2",
+    ]
+
+
 def test_pdf_magic_bytes_and_filename_safety():
     assert is_pdf_content(b"%PDF-1.7\n")
     assert not is_pdf_content(b"<html>not a PDF</html>")
@@ -393,15 +453,41 @@ def test_completion_and_bounded_retry():
     assert attempts == 2
 
 
-def test_capture_then_favorite_orders_normal_coins_and_skips_tokenized_capture(monkeypatch, tmp_path):
+def test_manifest_save_retries_transient_windows_file_locks(monkeypatch, tmp_path):
+    path = tmp_path / "manifest.json"
+    original_replace = archive.os.replace
+    attempts = 0
+
+    def replace_with_transient_lock(source, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("temporary file lock")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(archive.os, "replace", replace_with_transient_lock)
+
+    archive._save_manifest(path, {"version": 1, "coins": {}, "pages": []})
+
+    assert attempts == 3
+    assert '"version": 1' in path.read_text(encoding="utf-8")
+    assert not path.with_suffix(".tmp").exists()
+
+
+def test_capture_then_favorite_orders_normal_coins_and_skips_favorites_only_names(
+    monkeypatch, tmp_path
+):
     normal = Coin("Example", "https://example.com/coin", "active", 1)
-    tokenized = Coin(
-        "Example Tokenized Stock",
-        "https://example.com/tokenized",
-        "inactive",
-        1,
-        symbol="ETS",
-    )
+    favorites_only = [
+        Coin(name, f"https://example.com/{slug}", "inactive", 1)
+        for name, slug in (
+            ("Example Tokenized Stock", "tokenized"),
+            ("Wrapped Example", "wrapped"),
+            ("Example Bridged", "bridged"),
+            ("Example Staked", "staked"),
+            ("Example xStock", "xstock"),
+        )
+    ]
     events = []
     monkeypatch.setattr(
         archive,
@@ -414,7 +500,7 @@ def test_capture_then_favorite_orders_normal_coins_and_skips_tokenized_capture(m
     monkeypatch.setattr(
         archive,
         "add_coins_to_favorites",
-        lambda _page, coins: events.append(f"favorite:{coins[0].name}")
+        lambda _page, coins, _capacity=None: events.append(f"favorite:{coins[0].name}")
         or [{"coin_url": coins[0].url, "status": "already_active"}],
     )
 
@@ -427,23 +513,65 @@ def test_capture_then_favorite_orders_normal_coins_and_skips_tokenized_capture(m
         {},
         False,
     )
-    tokenized_details, tokenized_pending, tokenized_favorites = archive._capture_then_favorite(
-        SimpleNamespace(),
-        tokenized,
-        tmp_path / "screenshots",
-        tmp_path / "whitepapers",
-        tmp_path,
-        {},
-        False,
-    )
+    favorites_only_results = [
+        archive._capture_then_favorite(
+            SimpleNamespace(),
+            coin,
+            tmp_path / "screenshots",
+            tmp_path / "whitepapers",
+            tmp_path,
+            {},
+            False,
+        )
+        for coin in favorites_only
+    ]
 
-    assert events == ["capture", "favorite:Example", "favorite:Example Tokenized Stock"]
+    assert events == [
+        "capture",
+        "favorite:Example",
+        *(f"favorite:{coin.name}" for coin in favorites_only),
+    ]
     assert details == {"status": "completed"}
     assert pending == "https://example.com/doc"
     assert favorites[0]["status"] == "already_active"
-    assert tokenized_details is None
-    assert tokenized_pending is None
-    assert tokenized_favorites[0]["status"] == "already_active"
+    assert all(result[0] is None for result in favorites_only_results)
+    assert all(result[1] is None for result in favorites_only_results)
+    assert all(result[2][0]["status"] == "already_active" for result in favorites_only_results)
+
+
+def test_favorite_capacity_is_reused_between_capture_then_favorite_steps(monkeypatch):
+    coins = [
+        Coin("First", "https://www.coingecko.com/en/coins/first", "inactive", 1),
+        Coin("Second", "https://www.coingecko.com/en/coins/second", "inactive", 1),
+    ]
+    calls = {"options": 0, "assets": 0}
+    monkeypatch.setattr(archive, "_navigate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(archive, "_is_authenticated", lambda _page: True)
+    monkeypatch.setattr(archive, "_open_coin_portfolio_picker", lambda *_args: "opened")
+
+    def portfolio_options(_page):
+        calls["options"] += 1
+        return [{"number": 16, "href": "/en/portfolios/16", "label": "⭐ 16"}]
+
+    def portfolio_assets(*_args):
+        calls["assets"] += 1
+        return {f"/en/coins/coin-{number}" for number in range(10)}
+
+    monkeypatch.setattr(archive, "_portfolio_options", portfolio_options)
+    monkeypatch.setattr(archive, "_portfolio_asset_urls", portfolio_assets)
+    monkeypatch.setattr(
+        archive,
+        "_click_portfolio_row_plus",
+        lambda *_args: {"found": True, "clicked": True, "verified": True},
+    )
+
+    capacity = archive.PortfolioCapacity()
+    first = archive.add_coins_to_favorites(SimpleNamespace(), [coins[0]], capacity)
+    second = archive.add_coins_to_favorites(SimpleNamespace(), [coins[1]], capacity)
+
+    assert [first[0]["status"], second[0]["status"]] == ["added", "added"]
+    assert calls == {"options": 1, "assets": 1}
+    assert capacity.folder_count == 12
 
 
 def test_full_page_screenshot_saves_atomically_and_cleans_temporary_file(tmp_path):
@@ -458,6 +586,25 @@ def test_full_page_screenshot_saves_atomically_and_cleans_temporary_file(tmp_pat
 
     assert target.read_bytes() == b"png"
     assert not target.with_name(target.stem + ".part" + target.suffix).exists()
+
+
+def test_prepare_page_for_capture_waits_for_network_idle_for_at_most_five_seconds():
+    calls = []
+
+    class FakePage:
+        def wait_for_load_state(self, state, *, timeout):
+            calls.append((state, timeout))
+            raise archive.PlaywrightTimeoutError("network still active")
+
+        def evaluate(self, _script):
+            return 100
+
+        def wait_for_timeout(self, _milliseconds):
+            pass
+
+    archive._prepare_page_for_capture(FakePage(), max_scroll_rounds=1)
+
+    assert calls == [("networkidle", 5000)]
 
 
 def test_rendered_whitepaper_pdf_is_validated_and_saved_atomically(tmp_path):
@@ -544,6 +691,44 @@ def test_authentication_detection_uses_sign_in_modal_and_labels():
     assert _is_authenticated(_FakeAuthPage(False, "Home\nLog in")) is False
     assert _is_authenticated(_FakeAuthPage(False, "Home\nCreate an account")) is False
     assert _is_authenticated(_FakeAuthPage(False, "Home\nPortfolio\nCoins")) is True
+
+
+def test_authentication_detection_surfaces_unreadable_page_state():
+    class FailedBody:
+        def inner_text(self, timeout=None):
+            raise archive.PlaywrightError("body unavailable")
+
+    class FailedAuthPage:
+        def locator(self, selector):
+            return _FakeVisibleLocator(False) if selector.startswith("button[") else FailedBody()
+
+    try:
+        _is_authenticated(FailedAuthPage())
+    except RuntimeError as error:
+        assert "Unable to read CoinGecko authentication state" in str(error)
+    else:
+        raise AssertionError("Unreadable authentication state must not be reported as logged out")
+
+
+def test_reopen_closed_browser_page_creates_a_replacement():
+    replacement = object()
+
+    class ClosedPage:
+        def is_closed(self):
+            return True
+
+    class Context:
+        def __init__(self):
+            self.created = 0
+
+        def new_page(self):
+            self.created += 1
+            return replacement
+
+    context = Context()
+
+    assert archive._reopen_closed_page(context, ClosedPage()) is replacement
+    assert context.created == 1
 
 
 def test_listing_fallback_keeps_symbol_when_signed_out(monkeypatch):
@@ -666,6 +851,11 @@ def test_tokenized_stock_names_are_recognized_for_favorites_only_handling():
     assert is_tokenized_stock_name("Tokenized Stock", "TST")
     assert is_tokenized_stock_name("bStocks Tokenized Stock", "BST")
     assert not is_tokenized_stock_name("Example Coin", "EX")
+    assert is_favorites_only_name("Wrapped Example")
+    assert is_favorites_only_name("Example Bridged")
+    assert is_favorites_only_name("Example Staked")
+    assert is_favorites_only_name("Example xStock")
+    assert not is_favorites_only_name("Example Wrappedness")
 
 
 def test_add_coins_to_favorites_uses_latest_portfolio_and_skips_duplicate_inputs(monkeypatch):
@@ -717,6 +907,55 @@ def test_add_coins_to_favorites_uses_latest_portfolio_and_skips_duplicate_inputs
     assert [result.get("portfolio_folder") for result in results] == [16, 16, None, None]
     assert opened == [coins[0].url, coins[0].url, coins[1].url]
     assert selected_folders == [16, 16]
+
+
+def test_favorite_authentication_is_checked_on_coin_gecko_after_capture(monkeypatch):
+    coin = Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1)
+    auth_urls = []
+    page = SimpleNamespace(url="https://example.com/")
+
+    def navigate(current_page, url):
+        current_page.url = url
+        return None
+
+    def authenticated(current_page):
+        auth_urls.append(current_page.url)
+        return "www.coingecko.com/en/coins/" in current_page.url
+
+    monkeypatch.setattr(archive, "_navigate", navigate)
+    monkeypatch.setattr(archive, "_is_authenticated", authenticated)
+    monkeypatch.setattr(
+        archive,
+        "_open_coin_portfolio_picker",
+        lambda current_page, current_coin: (
+            "active"
+            if archive._coin_detail_is_open(current_page, current_coin)
+            else "unknown"
+        ),
+    )
+
+    results = archive.add_coins_to_favorites(page, [coin])
+
+    assert auth_urls == [coin.url]
+    assert results[0]["status"] == "already_active"
+
+
+def test_favorite_add_does_not_swallow_coingecko_access_blocks(monkeypatch):
+    coin = Coin("Example", "https://www.coingecko.com/en/coins/example", "inactive", 1)
+    monkeypatch.setattr(
+        archive,
+        "_navigate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            archive.AccessWallError("CoinGecko access block")
+        ),
+    )
+
+    try:
+        archive.add_coins_to_favorites(SimpleNamespace(), [coin])
+    except archive.AccessWallError:
+        pass
+    else:
+        raise AssertionError("CoinGecko access blocks must stop the run")
 
 
 def test_add_coins_to_favorites_creates_next_portfolio_when_latest_is_full(monkeypatch):
@@ -835,6 +1074,9 @@ def test_portfolio_folder_option_index_matches_exact_numeric_label():
 
 
 def test_click_portfolio_row_plus_targets_exact_numbered_detail_picker_row():
+    assert archive._PORTFOLIO_PICKER_ROW_SELECTOR == (
+        'div[data-coin-favorites-target="dropdownItem"]'
+    )
     clicked = []
 
     class Plus:

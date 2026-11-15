@@ -76,6 +76,12 @@ class Coin:
         }
 
 
+@dataclass
+class PortfolioCapacity:
+    latest_folder: dict[str, int | str] | None = None
+    folder_count: int = 0
+
+
 class AccessWallError(RuntimeError):
     pass
 
@@ -108,6 +114,14 @@ def is_tokenized_stock_name(name: str, symbol: str = "") -> bool:
     """Identify tokenized securities that should be favorited without capture."""
     text = " ".join((name, symbol)).casefold()
     return "tokenized" in text and ("stock" in text or "share" in text or "token" in text)
+
+
+def is_favorites_only_name(name: str, symbol: str = "") -> bool:
+    """Identify assets that should be favorited without site or document capture."""
+    text = " ".join((name, symbol)).casefold()
+    return is_tokenized_stock_name(name, symbol) or bool(
+        re.search(r"\b(?:xstock|wrapped|bridged|staked)\b", text)
+    )
 
 
 def assign_duplicate_indices(coins: Iterable[Coin]) -> list[Coin]:
@@ -623,7 +637,14 @@ def _save_manifest(path: Path, manifest: dict) -> None:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             json.dump(manifest, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
-        os.replace(temporary, path)
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.5 * (2**attempt))
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -722,8 +743,8 @@ def _is_authenticated(page: Page) -> bool:
         pass
     try:
         body = page.locator("body").inner_text(timeout=5000)
-    except PlaywrightError:
-        return False
+    except PlaywrightError as error:
+        raise RuntimeError("Unable to read CoinGecko authentication state.") from error
     lines = {line.strip().casefold() for line in body.splitlines() if line.strip()}
     signed_out_labels = {
         "log in",
@@ -803,7 +824,6 @@ _DETAIL_PORTFOLIO_PICKER_SELECTOR = (
 )
 _PORTFOLIO_PICKER_ROW_SELECTOR = (
     'div[data-coin-favorites-target="dropdownItem"]'
-    '[data-action*="click->coin-favorites#handle"]'
 )
 _PORTFOLIO_PICKER_PLUS_SELECTOR = (
     f"{_DETAIL_PORTFOLIO_PICKER_SELECTOR} "
@@ -879,7 +899,8 @@ def _portfolio_asset_urls(page: Page, portfolio_href: str) -> set[str]:
 
 def _open_coin_portfolio_picker(page: Page, coin: Coin) -> str:
     try:
-        _navigate(page, coin.url)
+        if not _coin_detail_is_open(page, coin):
+            _navigate(page, coin.url)
         state = page.evaluate(_COIN_DETAIL_PORTFOLIO_STATE_JS)
         if state != "inactive":
             return state
@@ -987,19 +1008,34 @@ def _coin_detail_portfolio_state(page: Page) -> str:
     return page.evaluate(_COIN_DETAIL_PORTFOLIO_STATE_JS)
 
 
-def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
+def _coin_detail_is_open(page: Page, coin: Coin) -> bool:
+    try:
+        current = urlsplit(page.url)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    target = urlsplit(coin.url)
+    return (
+        current.netloc.casefold() == target.netloc.casefold()
+        and current.path.rstrip("/") == target.path.rstrip("/")
+    )
+
+
+def _reopen_closed_page(context: BrowserContext, page: Page) -> Page:
+    if page.is_closed():
+        print("브라우저 탭이 닫혀 새 탭에서 계속합니다.")
+        return context.new_page()
+    return page
+
+
+def add_coins_to_favorites(
+    page: Page,
+    coins: Iterable[Coin],
+    capacity: PortfolioCapacity | None = None,
+) -> list[dict]:
     """Add unstarred coins to the newest portfolio, verifying capacity and success."""
     results: list[dict] = []
     seen_urls: set[str] = set()
-    latest_folder: dict[str, int | str] | None = None
-    folder_count = 0
-    try:
-        authenticated = _is_authenticated(page)
-    except Exception as error:
-        authenticated = False
-        auth_error = str(error)
-    else:
-        auth_error = ""
+    capacity = capacity or PortfolioCapacity()
 
     for coin in coins:
         key = coin.url.rstrip("/").lower()
@@ -1013,14 +1049,28 @@ def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
             results.append(record)
             continue
         seen_urls.add(key)
-        if not authenticated:
-            record["status"] = "login_required"
-            if auth_error:
-                record["error"] = auth_error
-            results.append(record)
-            continue
         if coin.portfolio == "active":
             record["status"] = "already_active"
+            results.append(record)
+            continue
+
+        try:
+            if not _coin_detail_is_open(page, coin):
+                _navigate(page, coin.url)
+            authenticated = _is_authenticated(page)
+        except AccessWallError:
+            raise
+        except Exception as error:
+            record["status"] = f"failed:{type(error).__name__}"
+            record["error"] = str(error)
+            results.append(record)
+            print(
+                f"즐겨찾기 처리 실패: {coin.label()} "
+                f"({type(error).__name__}: {error})"
+            )
+            continue
+        if not authenticated:
+            record["status"] = "login_required"
             results.append(record)
             continue
 
@@ -1039,15 +1089,19 @@ def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
                 results.append(record)
                 continue
 
-            if latest_folder is None:
+            if capacity.latest_folder is None:
                 options = _portfolio_options(page)
                 if not options:
                     record["status"] = "portfolio_folder_not_found"
                     results.append(record)
                     continue
-                latest_folder = max(options, key=lambda option: int(option["number"]))
-                assets = _portfolio_asset_urls(page, str(latest_folder["href"]))
-                folder_count = len(assets)
+                capacity.latest_folder = max(
+                    options, key=lambda option: int(option["number"])
+                )
+                assets = _portfolio_asset_urls(
+                    page, str(capacity.latest_folder["href"])
+                )
+                capacity.folder_count = len(assets)
                 picker_state = _open_coin_portfolio_picker(page, coin)
                 if picker_state != "opened":
                     record["status"] = (
@@ -1060,20 +1114,20 @@ def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
                     results.append(record)
                     continue
 
-            if folder_count >= PORTFOLIO_FOLDER_SIZE:
-                next_number = int(latest_folder["number"]) + 1
+            if capacity.folder_count >= PORTFOLIO_FOLDER_SIZE:
+                next_number = int(capacity.latest_folder["number"]) + 1
                 created = _create_portfolio(page, next_number)
                 if created is None:
                     record["status"] = "portfolio_creation_failed"
                     results.append(record)
                     continue
-                latest_folder = created
-                folder_count = 0
+                capacity.latest_folder = created
+                capacity.folder_count = 0
                 picker_state = _open_coin_portfolio_picker(page, coin)
                 if picker_state == "active":
                     record["portfolio_folder"] = next_number
                     record["status"] = "added"
-                    folder_count += 1
+                    capacity.folder_count += 1
                     results.append(record)
                     continue
                 if picker_state != "opened":
@@ -1085,7 +1139,7 @@ def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
                     results.append(record)
                     continue
 
-            folder_number = int(latest_folder["number"])
+            folder_number = int(capacity.latest_folder["number"])
             record["portfolio_folder"] = folder_number
             add_outcome = _click_portfolio_row_plus(page, folder_number)
             if not add_outcome.get("found") or not add_outcome.get("clicked"):
@@ -1097,11 +1151,17 @@ def add_coins_to_favorites(page: Page, coins: Iterable[Coin]) -> list[dict]:
                 results.append(record)
                 continue
             record["status"] = "added"
-            folder_count += 1
-        except PlaywrightTimeoutError:
-            record["status"] = (
-                "login_required" if not _is_authenticated(page) else "verification_failed"
-            )
+            capacity.folder_count += 1
+        except AccessWallError:
+            raise
+        except PlaywrightTimeoutError as error:
+            try:
+                record["status"] = (
+                    "login_required" if not _is_authenticated(page) else "verification_failed"
+                )
+            except (PlaywrightError, RuntimeError) as auth_error:
+                record["status"] = "verification_failed"
+                record["error"] = str(auth_error or error)
         except Exception as error:
             record["status"] = f"failed:{type(error).__name__}"
             record["error"] = str(error)
@@ -1382,6 +1442,13 @@ def _coin_details(
 
 def _prepare_page_for_capture(page: Page, *, min_wait_ms: int = 1200, max_scroll_rounds: int = 12) -> None:
     """Fully load a scroll-responsive page before taking a full-page screenshot."""
+    wait_for_load_state = getattr(page, "wait_for_load_state", None)
+    if callable(wait_for_load_state):
+        try:
+            wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+
     if not hasattr(page, "evaluate") and not hasattr(page, "wait_for_timeout"):
         return
     try:
@@ -1545,7 +1612,8 @@ def _capture_coin(
                 details["capture_source"] = "website"
                 captured_target = True
         except AccessWallError:
-            raise
+            details["website_status"] = "access_blocked"
+            details["review"].append("website_access_blocked")
         except Exception as error:
             details["review"].append(f"website_capture_failed:{type(error).__name__}")
     else:
@@ -1574,7 +1642,8 @@ def _capture_coin(
                 details["capture_source"] = "twitter"
                 captured_target = True
         except AccessWallError:
-            raise
+            details["twitter_status"] = "access_blocked"
+            details["review"].append("twitter_access_blocked")
         except Exception as error:
             details["review"].append(f"twitter_capture_failed:{type(error).__name__}")
     elif not captured_target and twitter_status != "ok":
@@ -1602,7 +1671,7 @@ def _capture_coin(
                     details["capture_source"] = "explorer"
                     captured_target = True
             except AccessWallError:
-                raise
+                details["review"].append("explorer_access_blocked")
             except Exception as error:
                 details["review"].append(f"explorer_capture_failed:{type(error).__name__}")
 
@@ -1672,10 +1741,11 @@ def _capture_then_favorite(
     output_root: Path,
     existing: dict,
     force: bool,
+    capacity: PortfolioCapacity | None = None,
 ) -> tuple[dict | None, str | None, list[dict]]:
     details = None
     pending_site = None
-    if not is_tokenized_stock_name(coin.name, coin.symbol):
+    if not is_favorites_only_name(coin.name, coin.symbol):
         if is_complete(existing) and not force:
             print(f"건너뜀(캡처 완료): {coin.label()}")
         else:
@@ -1683,9 +1753,9 @@ def _capture_then_favorite(
                 page, coin, screenshot_dir, pdf_dir, output_root
             )
     else:
-        print(f"즐겨찾기 전용 처리(Tokenized Stock): {coin.label()}")
+        print(f"즐겨찾기 전용 처리(캡처 제외 이름): {coin.label()}")
 
-    favorite_results = add_coins_to_favorites(page, [coin])
+    favorite_results = add_coins_to_favorites(page, [coin], capacity)
     return details, pending_site, favorite_results
 
 
@@ -1755,6 +1825,7 @@ def run(args: argparse.Namespace) -> int:
     whitepaper_sites: list[str] = []
     capture_results: list[dict] = []
     favorite_results: list[dict] = []
+    portfolio_capacity = PortfolioCapacity()
     all_coins: list[Coin] = []
     selected_urls: set[str] | None = _load_selection(args.selection_json)
     missing_selection: list[str] = []
@@ -1797,6 +1868,7 @@ def run(args: argparse.Namespace) -> int:
                     "이 프로필은 평소 Chrome 로그인과 공유되지 않습니다."
                 )
             for number in range(1, args.pages + 1):
+                page = _reopen_closed_page(context, page)
                 try:
                     coins = retry(lambda: _listing_page(page, number))
                 except AccessWallError:
@@ -1910,6 +1982,7 @@ def run(args: argparse.Namespace) -> int:
                 print(f"즐겨찾기 추가: {added}개 / 처리 {len(favorite_results)}개")
             else:
                 for coin in selected:
+                    page = _reopen_closed_page(context, page)
                     existing = manifest["coins"].get(coin.url, {})
                     details, pending_site, coin_favorites = _capture_then_favorite(
                         page,
@@ -1919,6 +1992,7 @@ def run(args: argparse.Namespace) -> int:
                         output_root,
                         existing,
                         args.force,
+                        portfolio_capacity,
                     )
                     if details is not None:
                         manifest["coins"][coin.url] = details
@@ -1943,7 +2017,10 @@ def run(args: argparse.Namespace) -> int:
                         manifest["coins"][item["coin_url"]] = favorite_record
                         print(f"즐겨찾기 결과: {item['status']} - {item.get('display_name')}")
                     _save_manifest(manifest_path, manifest)
-                    page.wait_for_timeout(1500)
+                    try:
+                        page.wait_for_timeout(1500)
+                    except PlaywrightError:
+                        page = _reopen_closed_page(context, page)
         finally:
             if owns_context:
                 context.close()
