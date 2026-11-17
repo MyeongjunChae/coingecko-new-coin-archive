@@ -25,6 +25,7 @@ from coingecko_archive import (
     _browser_executable,
     browser_user_data_dir,
     chrome_debug_endpoint,
+    is_public_http_url,
     symbol_in_name,
 )
 
@@ -38,18 +39,20 @@ DEFAULT_PORT = int(os.environ.get("COINGECKO_WEB_PORT", "8765"))
 LAST_SCAN = STATE_DIR / "web-last-scan.json"
 LAST_RESULT = STATE_DIR / "web-last-result.json"
 LAST_FAVORITES = STATE_DIR / "web-last-favorites.json"
+LAST_BOOKMARK_RESULT = STATE_DIR / "web-last-bookmark-result.json"
 SELECTION = STATE_DIR / "web-selection.json"
 
 
 def configure(output_dir: Path) -> None:
     global OUTPUT_DIR, STATE_DIR, LOG_DIR
-    global LAST_SCAN, LAST_RESULT, LAST_FAVORITES, SELECTION
+    global LAST_SCAN, LAST_RESULT, LAST_FAVORITES, LAST_BOOKMARK_RESULT, SELECTION
     OUTPUT_DIR = output_dir.expanduser().resolve()
     STATE_DIR = OUTPUT_DIR / ".state"
     LOG_DIR = STATE_DIR / "web-logs"
     LAST_SCAN = STATE_DIR / "web-last-scan.json"
     LAST_RESULT = STATE_DIR / "web-last-result.json"
     LAST_FAVORITES = STATE_DIR / "web-last-favorites.json"
+    LAST_BOOKMARK_RESULT = STATE_DIR / "web-last-bookmark-result.json"
     SELECTION = STATE_DIR / "web-selection.json"
 
 
@@ -140,6 +143,7 @@ class Job:
     error: str | None = None
     result: dict | list | None = None
     log: deque[str] = field(default_factory=lambda: deque(maxlen=500))
+    cleanup_paths: list[Path] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -162,11 +166,22 @@ class JobManager:
         self.last: Job | None = None
         self._process: subprocess.Popen | None = None
 
-    def start(self, kind: str, command: list[str], result_path: Path) -> Job:
+    def start(
+        self,
+        kind: str,
+        command: list[str],
+        result_path: Path,
+        cleanup_paths: list[Path] | None = None,
+    ) -> Job:
         with self._lock:
             if self.current and self.current.status == "running":
                 raise RuntimeError("이미 실행 중인 작업이 있습니다. 끝날 때까지 기다려 주세요.")
-            job = Job(id=uuid.uuid4().hex[:10], kind=kind, command=command)
+            job = Job(
+                id=uuid.uuid4().hex[:10],
+                kind=kind,
+                command=command,
+                cleanup_paths=cleanup_paths or [],
+            )
             log_path = LOG_DIR / f"{job.id}-{kind}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -228,6 +243,17 @@ class JobManager:
             job.status = "failed"
             tail = "\n".join(list(job.log)[-12:])
             job.error = tail or f"종료 코드 {returncode}"
+        cleanup_errors = []
+        for path in job.cleanup_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                cleanup_errors.append(f"{path}: {type(error).__name__}: {error}")
+        if cleanup_errors:
+            job.log.extend(f"Temporary input cleanup failed: {error}" for error in cleanup_errors)
+            if job.status == "succeeded":
+                job.status = "failed"
+                job.error = "\n".join(cleanup_errors)
         with self._lock:
             if self._process is process:
                 self._process = None
@@ -306,6 +332,17 @@ def latest_payload() -> dict:
         item["capture_status"] = record.get("status")
         item["favorite_status"] = record.get("favorite_status") or favorite_by_url.get(
             coin.get("coin_url")
+        )
+        item["capture_artifacts"] = any(
+            record.get(key)
+            for key in (
+                "screenshot",
+                "twitter_screenshot",
+                "whitepaper_screenshot",
+                "explorer_screenshots",
+                "pdf",
+                "pdf_attachments",
+            )
         )
         merged.append(item)
 
@@ -398,6 +435,61 @@ def _start_job(kind: str, mode: str, body: dict) -> dict:
     return {"job": job.to_dict(), "command": command}
 
 
+def _validate_bookmark_entries(entries: object) -> list[dict[str, str]]:
+    if not isinstance(entries, list):
+        raise ValueError("북마크 항목은 배열이어야 합니다.")
+    if len(entries) > 1000:
+        raise ValueError("한 번에 처리할 북마크는 최대 1,000개입니다.")
+    validated: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url", "")).strip()
+        if not is_public_http_url(url):
+            continue
+        parts = urlsplit(url)
+        hostname = (parts.hostname or "").rstrip(".").casefold()
+        key = url.rstrip("/").casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        title = " ".join(str(entry.get("title", "")).split()) or hostname
+        validated.append({"title": title[:180], "url": url})
+    return validated
+
+
+def _start_bookmark_capture(entries: object) -> dict:
+    bookmarks = _validate_bookmark_entries(entries)
+    if not bookmarks:
+        raise ValueError("처리 가능한 HTTP/HTTPS 북마크가 없습니다.")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    selection_path = STATE_DIR / f"bookmark-selection-{uuid.uuid4().hex}.json"
+    write_json(selection_path, bookmarks)
+    command = [
+        sys.executable,
+        "-u",
+        str(BASE_DIR / "bookmark_capture.py"),
+        "--bookmarks-json",
+        str(selection_path),
+        "--result-json",
+        str(LAST_BOOKMARK_RESULT),
+        "--output-dir",
+        str(OUTPUT_DIR),
+    ]
+    try:
+        job = MANAGER.start(
+            "bookmark-capture",
+            command,
+            LAST_BOOKMARK_RESULT,
+            cleanup_paths=[selection_path],
+        )
+    except Exception:
+        selection_path.unlink(missing_ok=True)
+        raise
+    return {"job": job.to_dict(), "count": len(bookmarks)}
+
+
 def _safe_output_path(relative: str) -> Path | None:
     candidate = (OUTPUT_DIR / relative).resolve()
     try:
@@ -440,6 +532,7 @@ def build_zip(scope: str = "latest") -> Path:
         ".state/web-last-scan.json",
         ".state/web-last-result.json",
         ".state/web-last-favorites.json",
+        ".state/web-last-bookmark-result.json",
     ):
         if (OUTPUT_DIR / name).exists():
             relative_files.add(name)
@@ -451,11 +544,21 @@ def build_zip(scope: str = "latest") -> Path:
             "twitter_screenshot",
             "whitepaper_screenshot",
             "pdf",
+            "pdf_attachments",
         ):
-            if record.get(key):
-                relative_files.add(str(record[key]))
+            value = record.get(key)
+            if isinstance(value, list):
+                relative_files.update(str(item) for item in value)
+            elif value:
+                relative_files.add(str(value))
         for item in record.get("explorer_screenshots", []) or []:
             relative_files.add(str(item))
+    bookmark_records = manifest.get("document_bookmarks", {}) if isinstance(manifest, dict) else {}
+    for record in bookmark_records.values() if isinstance(bookmark_records, dict) else []:
+        for key in ("screenshot", "pdf"):
+            if record.get(key):
+                relative_files.add(str(record[key]))
+        relative_files.update(str(item) for item in record.get("attachments", []) or [])
 
     sources = {
         relative: path
@@ -603,6 +706,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_start_job("capture", "capture", body))
             elif path == "/api/favorites":
                 self._send_json(_start_job("favorites", "favorites", body))
+            elif path == "/api/bookmark-captures":
+                self._send_json(_start_bookmark_capture(body.get("bookmarks")))
             elif path == "/api/job/cancel":
                 self._send_json({"cancelled": MANAGER.cancel()})
             elif path == "/api/chrome/open-inspect":
@@ -809,10 +914,13 @@ INDEX_HTML = r"""<!doctype html>
       <button id="scanBtn" class="secondary">목록 새로고침</button>
       <button id="runBtn" class="primary">원클릭 수집</button>
       <button id="favoriteBtn" class="secondary">선택 즐겨찾기 추가</button>
+      <button id="bookmarkCaptureBtn" class="secondary">임시코인 문서 캡처 (임시)</button>
       <button id="zipBtn" class="ghost">ZIP 다운로드</button>
       <button id="csvBtn" class="ghost">CSV</button>
       <button id="archiveAllBtn" class="link">전체 아카이브 ZIP</button>
     </div>
+    <p class="small">수집이 완료되고 포트폴리오에 추가된 코인은 Chrome 북마크의 <b>My space &gt; SITES &gt; Cryptocurrency Forums &gt; 완료 똥코인</b>에 저장됩니다.</p>
+    <p class="small">임시 버튼은 Chrome의 <b>임시코인</b> 폴더에 있는 문서를 캡처하고 PDF 첨부 링크를 다운로드합니다. 먼저 <code>bookmark_extension</code>을 Chrome에 로드해야 합니다.</p>
     <div class="row small">
       <label><input type="checkbox" id="selectAll"> 전체 선택</label>
       <span id="selectionInfo">0개 선택</span>
@@ -840,7 +948,10 @@ INDEX_HTML = r"""<!doctype html>
 <div id="toast" class="toast hidden"></div>
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { coins: [], job: null, chrome: null, schedule: null, timer: null };
+const state = {
+  coins: [], job: null, chrome: null, schedule: null, timer: null,
+  autoBookmarkJobs: new Set(),
+};
 const esc = (value) => String(value ?? "");
 
 async function api(path, options = {}) {
@@ -886,7 +997,7 @@ function renderSchedule(schedule) {
 function renderJob(job) {
   state.job = job;
   const running = job && job.status === "running";
-  for (const id of ["scanBtn", "runBtn", "favoriteBtn", "disableScheduleBtn", "openInspectBtn"]) {
+  for (const id of ["scanBtn", "runBtn", "favoriteBtn", "bookmarkCaptureBtn", "disableScheduleBtn", "openInspectBtn"]) {
     $(id).disabled = running;
   }
   $("cancelBtn").classList.toggle("hidden", !running);
@@ -1004,6 +1115,35 @@ function requestBody() {
   };
 }
 
+function extensionRequest(action, entries = []) {
+  return new Promise((resolve, reject) => {
+    const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const timeout = setTimeout(() => {
+      window.removeEventListener("message", onMessage);
+      reject(new Error("북마크 확장 프로그램 응답 시간이 초과되었습니다. 설치 및 활성 상태를 확인하세요."));
+    }, 20000);
+    function onMessage(event) {
+      if (
+        event.source !== window ||
+        event.origin !== location.origin ||
+        event.data?.channel !== "coingecko-archive-bookmarks-response" ||
+        event.data?.requestId !== requestId
+      ) return;
+      clearTimeout(timeout);
+      window.removeEventListener("message", onMessage);
+      if (event.data.error) reject(new Error(event.data.error));
+      else resolve(event.data.result);
+    }
+    window.addEventListener("message", onMessage);
+    window.postMessage({
+      channel: "coingecko-archive-bookmarks-request",
+      requestId,
+      action,
+      entries,
+    }, location.origin);
+  });
+}
+
 async function startJob(path, body) {
   try {
     const data = await api(path, { method: "POST", body: JSON.stringify(body) });
@@ -1034,9 +1174,63 @@ async function refreshState() {
     if (!data.running) {
       stopPolling();
       await loadLatest();
+      const job = data.job;
+      if (
+        job?.kind === "capture" &&
+        job.status === "succeeded" &&
+        !state.autoBookmarkJobs.has(job.id)
+      ) {
+        state.autoBookmarkJobs.add(job.id);
+        await bookmarkCompletedCoins();
+      }
     }
   } catch (error) {
     stopPolling();
+    toast(error.message, "error");
+  }
+}
+
+async function bookmarkCompletedCoins() {
+  try {
+    const payload = await api("/api/latest");
+    const entries = (payload.coins || []).filter((coin) => {
+      const favorited = ["added", "already_active"].includes(coin.favorite_status);
+      const favoriteOnly = /tokenized|xstock|wrapped|bridged|staked/i.test(
+        `${coin.name || ""} ${coin.symbol || ""}`
+      );
+      return favorited && (coin.capture_artifacts || favoriteOnly);
+    }).map((coin) => ({
+      title: coin.display_name || coin.name || coin.coin_url,
+      url: coin.coin_url,
+    }));
+    if (!entries.length) return;
+    const result = await extensionRequest("add-coins", entries);
+    const count = (result.added || []).length;
+    toast(
+      `Chrome 북마크 처리 완료: 신규 ${count}개, 이미 있음 ${(result.already_present || []).length}개`,
+      "ok"
+    );
+  } catch (error) {
+    toast(`Chrome 북마크를 추가하지 못했습니다: ${error.message}`, "error");
+  }
+}
+
+async function captureTemporaryBookmarks() {
+  try {
+    const bookmarks = await extensionRequest("get-temporary");
+    if (!bookmarks.length) {
+      toast("임시코인 폴더에 처리할 북마크가 없습니다.", "error");
+      return;
+    }
+    if (!confirm(`임시코인 폴더의 문서 ${bookmarks.length}개를 캡처하고 PDF 첨부 링크를 다운로드할까요?`)) return;
+    const data = await api("/api/bookmark-captures", {
+      method: "POST",
+      body: JSON.stringify({ bookmarks }),
+    });
+    renderJob(data.job);
+    toast(`문서 캡처를 시작했습니다. 대상 ${data.count}개`, "ok");
+    startPolling();
+  } catch (error) {
     toast(error.message, "error");
   }
 }
@@ -1064,6 +1258,7 @@ $("favoriteBtn").addEventListener("click", () => {
   if (!confirm(`선택한 ${urls.length}개 코인을 CoinGecko 즐겨찾기에 추가할까요?`)) return;
   startJob("/api/favorites", { ...requestBody(), urls });
 });
+$("bookmarkCaptureBtn").addEventListener("click", captureTemporaryBookmarks);
 $("selectAll").addEventListener("change", (event) => {
   document.querySelectorAll(".coin-check").forEach((node) => { node.checked = event.target.checked; });
   updateSelection();

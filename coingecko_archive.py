@@ -4,10 +4,12 @@ import argparse
 import base64
 import csv
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -31,6 +33,7 @@ from playwright.sync_api import (
 
 LIST_URL = "https://www.coingecko.com/en/new-cryptocurrencies"
 MAX_PDF_BYTES = 100 * 1024 * 1024
+MAX_PDF_ATTACHMENTS = 20
 RETRIES = 3
 PORTFOLIO_FOLDER_SIZE = 1000
 T = TypeVar("T")
@@ -384,6 +387,32 @@ def extract_labeled_link(html: str, labels: set[str], base_url: str) -> tuple[st
     return None, "missing" if not found else "ambiguous"
 
 
+def extract_pdf_attachment_links(html: str, base_url: str) -> list[str]:
+    """Find explicit PDF links and download links on a document page."""
+    soup = BeautifulSoup(html, "html.parser")
+    found: set[str] = set()
+    for anchor in soup.select("a[href]"):
+        href = urljoin(base_url, str(anchor["href"]))
+        parts = urlsplit(href)
+        if parts.scheme not in {"http", "https"}:
+            continue
+        label = " ".join(
+            (
+                anchor.get_text(" ", strip=True),
+                str(anchor.get("title", "")),
+                str(anchor.get("aria-label", "")),
+            )
+        ).casefold()
+        content_type = str(anchor.get("type", "")).casefold()
+        if (
+            parts.path.casefold().endswith(".pdf")
+            or content_type == "application/pdf"
+            or re.search(r"\bpdf\b", label)
+        ):
+            found.add(urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, "")))
+    return sorted(found)
+
+
 def _external_url(href: str, base_url: str) -> str | None:
     value = urljoin(base_url, href)
     parts = urlsplit(value)
@@ -413,6 +442,34 @@ def _labeled_link_row_targets(html: str, labels: set[str], base_url: str) -> lis
     return sorted(found)
 
 
+_SECONDARY_SITE_LABELS = {
+    "docs",
+    "doc",
+    "documentation",
+    "wiki",
+    "whitepaper",
+    "whitepapers",
+    "explorer",
+    "scan",
+    "blog",
+    "news",
+    "status",
+    "help",
+    "support",
+    "forum",
+}
+
+
+def _is_secondary_site(href: str) -> bool:
+    """Docs/explorer/blog subdomains are not the project's main website."""
+    parts = urlsplit(href)
+    labels = (parts.hostname or "").lower().split(".")
+    if len(labels) > 1 and labels[0] in _SECONDARY_SITE_LABELS:
+        return True
+    path = parts.path.strip("/").casefold()
+    return path.startswith(("docs", "whitepaper", "explorer"))
+
+
 def extract_coin_website(html: str, base_url: str) -> tuple[str | None, str]:
     links = [
         href
@@ -420,6 +477,13 @@ def extract_coin_website(html: str, base_url: str) -> tuple[str | None, str]:
         if text not in {"whitepaper", "white paper"}
     ]
     unique = set(links)
+    if len(unique) > 1:
+        # CoinGecko often lists "explorer.example.com" next to the real site in
+        # the same "Website" cell, which used to make every such coin ambiguous
+        # and skip the site screenshot entirely.
+        primary = {href for href in unique if not _is_secondary_site(href)}
+        if primary:
+            unique = primary
     if len(unique) == 1:
         return next(iter(unique)), "ok"
     if len(unique) > 1:
@@ -561,6 +625,28 @@ def output_path(
 
 def is_pdf_content(prefix: bytes) -> bool:
     return prefix.startswith(b"%PDF-")
+
+
+def is_public_http_url(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    hostname = (parts.hostname or "").rstrip(".").casefold()
+    if (
+        parts.scheme not in {"http", "https"}
+        or not hostname
+        or parts.username is not None
+        or parts.password is not None
+        or hostname == "localhost"
+        or hostname.endswith((".localhost", ".local"))
+    ):
+        return False
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return True
+    return address.is_global
 
 
 def is_complete(record: dict) -> bool:
@@ -716,8 +802,64 @@ def _save_preview(path: Path, coins: Iterable[Coin]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+_BODY_SNAPSHOT_JS = r"""
+() => {
+  const visible = (element) => {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0
+      && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  return {
+    ready: document.readyState,
+    text: document.body ? document.body.innerText : '',
+    signIn: visible(document.querySelector("button[data-action*='openSignInModal']")),
+    challenge: document.querySelectorAll(
+      "iframe[src*='challenges.cloudflare.com']"
+    ).length,
+  };
+}
+"""
+
+
+def _body_snapshot(page: Page, *, attempts: int = 10) -> dict:
+    """Read the page text with a single JavaScript call.
+
+    Playwright's locators auto-wait for the current *and* the next document,
+    so while CoinGecko performs a client-side hop a locator read can block for
+    the full timeout even though the DOM is already rendered. A plain
+    ``evaluate`` returns immediately instead.
+    """
+    evaluate = getattr(page, "evaluate", None)
+    if callable(evaluate):
+        for _ in range(attempts):
+            try:
+                snapshot = evaluate(_BODY_SNAPSHOT_JS)
+            except PlaywrightError:
+                snapshot = None
+            if isinstance(snapshot, dict) and str(snapshot.get("text") or "").strip():
+                return snapshot
+            page.wait_for_timeout(300)
+        raise RuntimeError("페이지 본문을 읽지 못했습니다(렌더러 응답 지연).")
+
+    # Reduced page objects (tests, alternate drivers): read through locators.
+    try:
+        sign_in = page.locator(
+            "button[data-action*='openSignInModal']"
+        ).first.is_visible(timeout=2000)
+    except PlaywrightError:
+        sign_in = False
+    try:
+        text = page.locator("body").inner_text(timeout=15_000)
+    except PlaywrightError as error:
+        raise RuntimeError("페이지 본문을 읽지 못했습니다.") from error
+    return {"text": text, "signIn": sign_in, "challenge": 0, "ready": "unknown"}
+
+
 def _check_access_wall(page: Page) -> None:
-    body = page.locator("body").inner_text(timeout=5000).casefold()
+    snapshot = _body_snapshot(page)
+    body = str(snapshot.get("text") or "").casefold()
     markers = (
         "verify you are human",
         "checking your browser",
@@ -727,24 +869,19 @@ def _check_access_wall(page: Page) -> None:
         "unusual traffic",
         "checking if the site connection is secure",
     )
-    challenge_frame = page.locator("iframe[src*='challenges.cloudflare.com']").count() > 0
-    if challenge_frame or any(marker in body for marker in markers):
+    if snapshot.get("challenge") or any(marker in body for marker in markers):
         raise AccessWallError("An anti-bot or access challenge was detected; stopping without bypassing it.")
 
 
 def _is_authenticated(page: Page) -> bool:
     """CoinGecko shows a sign-in modal button and "Log in"/"Sign up" text when signed out."""
     try:
-        if page.locator("button[data-action*='openSignInModal']").first.is_visible(
-            timeout=2000
-        ):
-            return False
-    except PlaywrightError:
-        pass
-    try:
-        body = page.locator("body").inner_text(timeout=5000)
-    except PlaywrightError as error:
+        snapshot = _body_snapshot(page)
+    except RuntimeError as error:
         raise RuntimeError("Unable to read CoinGecko authentication state.") from error
+    if snapshot.get("signIn"):
+        return False
+    body = str(snapshot.get("text") or "")
     lines = {line.strip().casefold() for line in body.splitlines() if line.strip()}
     signed_out_labels = {
         "log in",
@@ -797,22 +934,34 @@ _COIN_DETAIL_PORTFOLIO_STATE_JS = r"""
 
   const event = (button.getAttribute('data-analytics-event') || '').toLowerCase();
   const label = `${button.getAttribute('aria-label') || ''} ${button.innerText || ''}`.toLowerCase();
-  const star = button.querySelector('.fa-star, .fas, .far, .fa-solid, .fa-regular');
-  const classes = Array.from(star?.classList || []).map((name) => name.toLowerCase());
-  const controller = button.closest('[data-controller~="coin-favorites"]');
-  const dropdown = controller?.querySelector('[data-coin-favorites-target="dropdown"]');
-  const rows = [...(dropdown?.querySelectorAll(
-    'div[data-coin-favorites-target="dropdownItem"]'
-  ) || [])];
-  if (rows.some((row) => row.querySelector('i.fa-check, i.fa-check-circle'))) {
+  if (event.includes('remove_portfolio') || label.includes('remove from portfolio')) {
     return 'active';
   }
-  if (event.includes('remove_portfolio')
-      || label.includes('remove from portfolio')
-      || classes.includes('fas')
-      || classes.includes('fa-solid')) return 'active';
-  if (event.includes('select_add_portfolio_coin_cta')
-      && (classes.includes('far') || classes.includes('fa-regular'))) return 'inactive';
+
+  // CoinGecko renders the same controller twice (sticky bar + description), so
+  // read the dropdown that the picker itself uses: the first one that has rows.
+  const controller = [...document.querySelectorAll('[data-controller~="coin-favorites"]')]
+    .find((element) => element.querySelector('[data-coin-favorites-target="dropdown"]'));
+  const dropdown = controller?.querySelector('[data-coin-favorites-target="dropdown"]');
+  const icons = dropdown
+    ? [...dropdown.querySelectorAll(
+        '[data-coin-favorites-target="dropdownItem"] i'
+      )]
+    : [];
+  const hasClass = (name) => icons.some((icon) => icon.classList.contains(name));
+  if (hasClass('fa-check') || hasClass('fa-check-circle')) return 'active';
+  if (hasClass('fa-plus')) return 'inactive';
+
+  // Only the star glyph describes the saved state. Other icons in the button
+  // (chevrons, spinners) also carry ``fas``/``fa-solid``, which used to make
+  // every coin look like it was already in a portfolio.
+  const star = button.querySelector('i.fa-star');
+  if (star) {
+    const classes = Array.from(star.classList).map((name) => name.toLowerCase());
+    if (classes.includes('far') || classes.includes('fa-regular')) return 'inactive';
+    if (classes.includes('fas') || classes.includes('fa-solid')) return 'active';
+  }
+  if (event.includes('select_add_portfolio_coin_cta')) return 'inactive';
   return 'unknown';
 }
 """
@@ -833,6 +982,143 @@ _NEW_PORTFOLIO_OPTION_SELECTOR = (
     f'{_DETAIL_PORTFOLIO_PICKER_SELECTOR} '
     '[data-action*="coin-favorites#handleNewPortfolio"]'
 )
+
+# CoinGecko's coin page uses a Stimulus ``coin-favorites`` controller. The
+# dropdown only becomes usable after that controller receives the site's
+# ``coingecko-check-user-login`` event. When the event is missed (for example
+# after attaching to an existing tab), clicking "Add to Portfolio" silently
+# falls back to the logged-out "local portfolio" flow, so the dropdown never
+# opens and every favorite add fails. The helpers below inspect the DOM
+# directly, re-dispatch that login event once when needed, and click the
+# actual dropdown rows instead of relying on strict locators.
+_PORTFOLIO_DROPDOWN_INFO_JS = r"""
+() => {
+  const visible = (element) => {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0
+      && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const controller = [...document.querySelectorAll('[data-controller~="coin-favorites"]')]
+    .find((element) => element.querySelector('[data-coin-favorites-target="dropdown"]'));
+  if (!controller) return { ok: false, reason: 'controller_not_found' };
+  const dropdown = controller.querySelector('[data-coin-favorites-target="dropdown"]');
+  const buttons = [...controller.querySelectorAll(
+    'button[data-action*="coin-favorites#handleCoinFavourites"]'
+  )].filter(visible);
+  const button = buttons.find((element) => (
+    element.getAttribute('data-analytics-event-properties') || ''
+  ).includes('"sub_origin":"primary_cta"')) || buttons[0] || null;
+  const seen = new Set();
+  const rows = [];
+  for (const row of dropdown.querySelectorAll('[data-coin-favorites-target="dropdownItem"]')) {
+    const id = row.getAttribute('data-portfolio-id') || '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const icon = row.querySelector('i');
+    rows.push({
+      title: (row.innerText || '').trim().replace(/\s+/g, ' '),
+      portfolioId: id,
+      plus: !!icon && icon.classList.contains('fa-plus'),
+      checked: !!icon && icon.classList.contains('fa-check'),
+    });
+  }
+  return {
+    ok: true,
+    hasButton: !!button,
+    buttonText: button ? (button.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 120) : '',
+    dropdownVisible: !dropdown.classList.contains('tw-hidden') && visible(dropdown),
+    rows,
+  };
+}
+"""
+
+_PORTFOLIO_CLICK_PRIMARY_JS = r"""
+() => {
+  const visible = (element) => {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0
+      && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const controller = [...document.querySelectorAll('[data-controller~="coin-favorites"]')]
+    .find((element) => element.querySelector('[data-coin-favorites-target="dropdown"]'));
+  if (!controller) return { clicked: false, reason: 'controller_not_found' };
+  const buttons = [...controller.querySelectorAll(
+    'button[data-action*="coin-favorites#handleCoinFavourites"]'
+  )].filter(visible);
+  const button = buttons.find((element) => (
+    element.getAttribute('data-analytics-event-properties') || ''
+  ).includes('"sub_origin":"primary_cta"')) || buttons[0] || null;
+  if (!button) return { clicked: false, reason: 'primary_button_not_found' };
+  button.click();
+  return { clicked: true };
+}
+"""
+
+_PORTFOLIO_CLICK_ROW_JS = r"""
+(folderNumber) => {
+  const controller = [...document.querySelectorAll('[data-controller~="coin-favorites"]')]
+    .find((element) => element.querySelector('[data-coin-favorites-target="dropdown"]'));
+  if (!controller) return { clicked: false, reason: 'controller_not_found' };
+  const dropdown = controller.querySelector('[data-coin-favorites-target="dropdown"]');
+  const normalize = (value) => (value || '')
+    .replace(/[\u2b50\ufe0f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const pattern = new RegExp(`^(?:portfolio\\s+|folder\\s+|#)?${folderNumber}$`);
+  const seen = new Set();
+  const rows = [];
+  for (const row of dropdown.querySelectorAll('[data-coin-favorites-target="dropdownItem"]')) {
+    const id = row.getAttribute('data-portfolio-id') || '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    rows.push(row);
+  }
+  const match = rows.find((row) => pattern.test(normalize(row.innerText)));
+  if (!match) return { clicked: false, reason: 'row_not_found' };
+  const icon = match.querySelector('i');
+  if (icon && icon.classList.contains('fa-check')) {
+    return { clicked: false, already: true };
+  }
+  (icon || match).click();
+  return { clicked: true };
+}
+"""
+
+_PORTFOLIO_DISPATCH_LOGIN_JS = r"""
+() => {
+  if (window.__cgArchiveLoginEventDispatched) return false;
+  window.__cgArchiveLoginEventDispatched = true;
+  window.dispatchEvent(new CustomEvent('coingecko-check-user-login', {
+    detail: { userLoggedIn: true },
+  }));
+  return true;
+}
+"""
+
+_PORTFOLIO_SNAPSHOT_JS = r"""
+async () => {
+  const response = await fetch(
+    '/en/portfolios/all_coins?include_wallet_portfolio=true',
+    { credentials: 'same-origin' }
+  );
+  if (!response.ok) return { ok: false, status: response.status };
+  const data = await response.json();
+  const portfolios = Array.isArray(data) ? data : (data.portfolios || []);
+  return {
+    ok: true,
+    portfolios: portfolios.map((portfolio) => ({
+      id: portfolio.id,
+      title: portfolio.title,
+      count: Array.isArray(portfolio.coin_ids) ? portfolio.coin_ids.length : 0,
+    })),
+  };
+}
+"""
 
 
 def _portfolio_label_number(label: str) -> int | None:
@@ -897,33 +1183,150 @@ def _portfolio_asset_urls(page: Page, portfolio_href: str) -> set[str]:
     return assets
 
 
+def _portfolio_dropdown_info(page: Page) -> dict:
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return {"ok": False, "reason": "evaluate_unavailable"}
+    try:
+        info = evaluate(_PORTFOLIO_DROPDOWN_INFO_JS)
+    except PlaywrightError:
+        return {"ok": False, "reason": "evaluate_failed"}
+    return info if isinstance(info, dict) else {"ok": False, "reason": "invalid_result"}
+
+
+def _portfolio_dropdown_ready(page: Page) -> bool:
+    info = _portfolio_dropdown_info(page)
+    return bool(info.get("ok")) and any(row.get("portfolioId") for row in info.get("rows", []))
+
+
+def _initialize_portfolio_dropdown(page: Page) -> bool:
+    """Make sure CoinGecko's portfolio dropdown knows about the logged-in user.
+
+    CoinGecko only fills the dropdown after it receives its
+    ``coingecko-check-user-login`` event. That event is occasionally missed
+    when the tab was not freshly loaded, which made every favorite add fail.
+    Re-dispatch it once, then wait for the rows to appear.
+    """
+    if _portfolio_dropdown_ready(page):
+        return True
+    try:
+        page.evaluate(_PORTFOLIO_DISPATCH_LOGIN_JS)
+    except PlaywrightError:
+        return False
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        page.wait_for_timeout(300)
+        if _portfolio_dropdown_ready(page):
+            return True
+    return False
+
+
+def _portfolio_snapshot(page: Page) -> dict:
+    """Read the logged-in portfolio list (titles and coin counts) in one call."""
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return {"ok": False, "reason": "evaluate_unavailable"}
+    try:
+        snapshot = evaluate(_PORTFOLIO_SNAPSHOT_JS)
+    except PlaywrightError as error:
+        return {"ok": False, "reason": type(error).__name__}
+    return snapshot if isinstance(snapshot, dict) else {"ok": False, "reason": "invalid_result"}
+
+
 def _open_coin_portfolio_picker(page: Page, coin: Coin) -> str:
     try:
         if not _coin_detail_is_open(page, coin):
             _navigate(page, coin.url)
-        state = page.evaluate(_COIN_DETAIL_PORTFOLIO_STATE_JS)
-        if state != "inactive":
-            return state
-        button = page.locator(
-            'button[data-action*="coin-favorites#handleCoinFavourites"]'
-            '[data-analytics-event="select_add_portfolio_coin_cta"]'
-            '[data-analytics-event-properties*="primary_cta"]'
-        )
-        button.click(timeout=15_000)
-        page.wait_for_selector(
-            _NEW_PORTFOLIO_OPTION_SELECTOR,
-            state="attached",
-            timeout=15_000,
-        )
         state = _coin_detail_portfolio_state(page)
         if state == "active":
             return "active"
-        return "opened" if state == "inactive" else "unknown"
+        if state == "unknown":
+            # Retry once after the page finishes hydrating; the sticky CTA can
+            # briefly be the only visible control while scripts initialize.
+            page.wait_for_timeout(600)
+            state = _coin_detail_portfolio_state(page)
+            if state == "active":
+                return "active"
+
+        info = _portfolio_dropdown_info(page)
+        if not info.get("ok"):
+            return "unknown"
+        if info.get("dropdownVisible"):
+            return "opened"
+
+        # The dropdown is empty until the site initializes it. Do that before
+        # clicking, otherwise the click is treated as a logged-out favorite.
+        if not _portfolio_dropdown_ready(page):
+            _initialize_portfolio_dropdown(page)
+            info = _portfolio_dropdown_info(page)
+            if info.get("dropdownVisible"):
+                return "opened"
+
+        if not info.get("hasButton"):
+            return "unknown"
+        clicked = page.evaluate(_PORTFOLIO_CLICK_PRIMARY_JS)
+        if not isinstance(clicked, dict) or not clicked.get("clicked"):
+            return "unknown"
+
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            page.wait_for_timeout(250)
+            info = _portfolio_dropdown_info(page)
+            if info.get("dropdownVisible"):
+                state = _coin_detail_portfolio_state(page)
+                return "active" if state == "active" else "opened"
+        return "picker_timeout"
     except PlaywrightTimeoutError:
         return "picker_timeout"
+    except PlaywrightError:
+        return "unknown"
 
 
 def _click_portfolio_row_plus(page: Page, folder_number: int) -> dict:
+    info = _portfolio_dropdown_info(page)
+    if not info.get("ok"):
+        return _click_portfolio_row_plus_legacy(page, folder_number)
+    if not info.get("dropdownVisible"):
+        return {"found": False, "reason": "portfolio_picker_not_open"}
+    matches = [
+        row
+        for row in info.get("rows", [])
+        if row.get("portfolioId")
+        and _portfolio_label_number(str(row.get("title", ""))) == folder_number
+    ]
+    if not matches:
+        return {"found": False, "reason": "portfolio_row_not_found"}
+    if len(matches) > 1:
+        return {"found": False, "reason": "portfolio_row_ambiguous"}
+    if matches[0].get("checked"):
+        return {"found": True, "clicked": False, "verified": True, "already": True}
+
+    outcome = page.evaluate(_PORTFOLIO_CLICK_ROW_JS, folder_number)
+    if not isinstance(outcome, dict):
+        return {"found": False, "reason": "portfolio_row_click_failed"}
+    if outcome.get("already"):
+        return {"found": True, "clicked": False, "verified": True, "already": True}
+    if not outcome.get("clicked"):
+        return {
+            "found": False,
+            "reason": outcome.get("reason", "portfolio_row_click_failed"),
+        }
+
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        page.wait_for_timeout(300)
+        current = _portfolio_dropdown_info(page)
+        for row in current.get("rows", []):
+            if (
+                _portfolio_label_number(str(row.get("title", ""))) == folder_number
+                and row.get("checked")
+            ):
+                return {"found": True, "clicked": True, "verified": True}
+    return {"found": True, "clicked": True, "verified": False}
+
+
+def _click_portfolio_row_plus_legacy(page: Page, folder_number: int) -> dict:
+    """Locator-based fallback for pages where JavaScript evaluation is unavailable."""
     page.wait_for_selector(
         _PORTFOLIO_PICKER_PLUS_SELECTOR,
         state="visible",
@@ -951,33 +1354,41 @@ def _click_portfolio_row_plus(page: Page, folder_number: int) -> dict:
 
 
 def _create_portfolio(page: Page, folder_number: int) -> dict[str, int | str] | None:
-    create_link = page.locator(
-        _NEW_PORTFOLIO_OPTION_SELECTOR
-    ).first
+    create_link = page.locator(_NEW_PORTFOLIO_OPTION_SELECTOR).first
     if not create_link.count():
         return None
     create_link.click(timeout=10_000)
-    page.wait_for_timeout(200)
 
+    # The modal markup is fetched asynchronously, so wait for the real input
+    # instead of assuming it already exists.
+    identifier = re.compile(r"portfolio|name|title", re.IGNORECASE)
     name_input = None
-    inputs = page.locator("input")
-    for index in range(inputs.count()):
-        candidate = inputs.nth(index)
-        if not candidate.is_visible():
-            continue
-        identifier = " ".join(
-            filter(
-                None,
-                (
-                    candidate.get_attribute("name"),
-                    candidate.get_attribute("placeholder"),
-                    candidate.get_attribute("aria-label"),
-                ),
+    deadline = time.time() + 20
+    while time.time() < deadline and name_input is None:
+        inputs = page.locator("input")
+        for index in range(inputs.count()):
+            candidate = inputs.nth(index)
+            try:
+                if not candidate.is_visible():
+                    continue
+            except PlaywrightError:
+                continue
+            attributes = " ".join(
+                filter(
+                    None,
+                    (
+                        candidate.get_attribute("name"),
+                        candidate.get_attribute("placeholder"),
+                        candidate.get_attribute("aria-label"),
+                        candidate.get_attribute("id"),
+                    ),
+                )
             )
-        ).casefold()
-        if "name" in identifier or "portfolio" in identifier:
-            name_input = candidate
-            break
+            if identifier.search(attributes):
+                name_input = candidate
+                break
+        if name_input is None:
+            page.wait_for_timeout(400)
     if name_input is None:
         return None
     name_input.fill(str(folder_number))
@@ -987,7 +1398,7 @@ def _create_portfolio(page: Page, folder_number: int) -> dict[str, int | str] | 
     if submit.count() and submit.first.is_visible():
         submit.first.click(timeout=10_000)
     else:
-        buttons = page.get_by_role("button", name=re.compile(r"create|save", re.IGNORECASE))
+        buttons = page.get_by_role("button", name=re.compile(r"create|save|add", re.IGNORECASE))
         visible_buttons = [
             buttons.nth(index)
             for index in range(buttons.count())
@@ -997,10 +1408,20 @@ def _create_portfolio(page: Page, folder_number: int) -> dict[str, int | str] | 
             return None
         visible_buttons[-1].click(timeout=10_000)
 
-    page.wait_for_timeout(500)
-    for option in _portfolio_options(page):
-        if option["number"] == folder_number:
-            return option
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        page.wait_for_timeout(500)
+        for option in _portfolio_options(page):
+            if option["number"] == folder_number:
+                return option
+        for row in _portfolio_dropdown_info(page).get("rows", []):
+            if _portfolio_label_number(str(row.get("title", ""))) == folder_number:
+                return {
+                    "number": folder_number,
+                    "href": f"/en/portfolios/{row.get('portfolioId')}",
+                    "label": str(row.get("title", "")),
+                    "id": row.get("portfolioId"),
+                }
     return None
 
 
@@ -1090,7 +1511,26 @@ def add_coins_to_favorites(
                 continue
 
             if capacity.latest_folder is None:
-                options = _portfolio_options(page)
+                options: list[dict] = []
+                snapshot = _portfolio_snapshot(page)
+                if snapshot.get("ok"):
+                    for portfolio in snapshot.get("portfolios", []):
+                        number = _portfolio_label_number(
+                            str(portfolio.get("title", ""))
+                        )
+                        if number is None:
+                            continue
+                        options.append(
+                            {
+                                "number": number,
+                                "href": f"/en/portfolios/{portfolio.get('id')}",
+                                "label": str(portfolio.get("title", "")),
+                                "id": portfolio.get("id"),
+                                "count": int(portfolio.get("count") or 0),
+                            }
+                        )
+                if not options:
+                    options = _portfolio_options(page)
                 if not options:
                     record["status"] = "portfolio_folder_not_found"
                     results.append(record)
@@ -1098,10 +1538,13 @@ def add_coins_to_favorites(
                 capacity.latest_folder = max(
                     options, key=lambda option: int(option["number"])
                 )
-                assets = _portfolio_asset_urls(
-                    page, str(capacity.latest_folder["href"])
-                )
-                capacity.folder_count = len(assets)
+                if "count" in capacity.latest_folder:
+                    capacity.folder_count = int(capacity.latest_folder["count"])
+                else:
+                    assets = _portfolio_asset_urls(
+                        page, str(capacity.latest_folder["href"])
+                    )
+                    capacity.folder_count = len(assets)
                 picker_state = _open_coin_portfolio_picker(page, coin)
                 if picker_state != "opened":
                     record["status"] = (
@@ -1142,7 +1585,11 @@ def add_coins_to_favorites(
             folder_number = int(capacity.latest_folder["number"])
             record["portfolio_folder"] = folder_number
             add_outcome = _click_portfolio_row_plus(page, folder_number)
-            if not add_outcome.get("found") or not add_outcome.get("clicked"):
+            if not add_outcome.get("found"):
+                # The dropdown can close after a site re-render; reopen once.
+                if _open_coin_portfolio_picker(page, coin) == "opened":
+                    add_outcome = _click_portfolio_row_plus(page, folder_number)
+            if not add_outcome.get("found"):
                 record["status"] = add_outcome.get("reason", "portfolio_add_control_not_found")
                 results.append(record)
                 continue
@@ -1150,8 +1597,11 @@ def add_coins_to_favorites(
                 record["status"] = "verification_failed"
                 results.append(record)
                 continue
-            record["status"] = "added"
-            capacity.folder_count += 1
+            if add_outcome.get("already"):
+                record["status"] = "already_active"
+            else:
+                record["status"] = "added"
+                capacity.folder_count += 1
         except AccessWallError:
             raise
         except PlaywrightTimeoutError as error:
@@ -1218,6 +1668,8 @@ def _compress_pdf_if_needed(path: Path, threshold_bytes: int = 2 * 1024 * 1024) 
 
 
 def _download_pdf(url: str, target: Path) -> tuple[bool, str]:
+    if not is_public_http_url(url):
+        return False, "unsafe_url"
     temporary = target.with_suffix(target.suffix + ".part")
     try:
         with requests.get(url, stream=True, timeout=(15, 45), allow_redirects=True) as response:
@@ -1247,6 +1699,51 @@ def _download_pdf(url: str, target: Path) -> tuple[bool, str]:
             return True, f"pdf:{content_type or 'unknown-content-type'}"
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _download_pdf_attachments(
+    html: str,
+    base_url: str,
+    name: str,
+    symbol: str,
+    coin_url: str,
+    pdf_dir: Path,
+    output_root: Path,
+    duplicate_index: int = 1,
+) -> tuple[list[str], list[str]]:
+    saved: list[str] = []
+    issues: list[str] = []
+    all_links = [
+        url
+        for url in extract_pdf_attachment_links(html, base_url)
+        if url.rstrip("/") != base_url.rstrip("/")
+    ]
+    links = [url for url in all_links if is_public_http_url(url)]
+    unsafe_count = len(all_links) - len(links)
+    if unsafe_count:
+        issues.append(f"pdf_attachment_unsafe_url:{unsafe_count}")
+    if len(links) > MAX_PDF_ATTACHMENTS:
+        issues.append(f"pdf_attachment_limit:{len(links)}>{MAX_PDF_ATTACHMENTS}")
+    for index, url in enumerate(links[:MAX_PDF_ATTACHMENTS], start=1):
+        target = output_path(
+            pdf_dir,
+            name,
+            f"{coin_url}|{url}",
+            f"-attachment-{index}.pdf",
+            symbol,
+            duplicate_index=duplicate_index,
+        )
+        try:
+            ok, result = retry(lambda: _download_pdf(url, target))
+            if ok:
+                saved.append(str(target.relative_to(output_root)))
+            else:
+                issues.append(f"pdf_attachment_not_pdf:{index}:{result}")
+        except AccessWallError:
+            issues.append(f"pdf_attachment_access_blocked:{index}")
+        except Exception as error:
+            issues.append(f"pdf_attachment_failed:{index}:{type(error).__name__}")
+    return saved, issues
 
 
 def _browser_executable(browser: str) -> str | None:
@@ -1313,6 +1810,57 @@ def chrome_debug_endpoint(browser: str = "chrome", user_data_dir: str | None = N
     return read_devtools_active_port(directory)
 
 
+RELAY_PORT = 9223
+
+
+def _relay_enabled() -> bool:
+    """The relay is on by default; ``CG_ARCHIVE_CDP_RELAY=0`` disables it."""
+    return os.environ.get("CG_ARCHIVE_CDP_RELAY", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def relay_endpoint(port: int = RELAY_PORT) -> str | None:
+    """Return the local relay URL when the single-connection relay is running."""
+    if not _relay_enabled():
+        return None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            pass
+    except OSError:
+        return None
+    return f"ws://127.0.0.1:{port}/devtools/browser/relay"
+
+
+def ensure_relay(endpoint: str | None = None, port: int = RELAY_PORT) -> str | None:
+    """Reuse, or start once, the relay that keeps one console connection open.
+
+    Chrome 136+ shows its "Allow remote debugging" dialog for every new client
+    connection, which turned each capture run into a click-through-torture
+    exercise. The relay accepts those dialogs once and every later Playwright
+    attach reuses the same underlying connection.
+    """
+    running = relay_endpoint(port)
+    if running:
+        return running
+    try:
+        from cdp_relay import start_background
+    except Exception:  # noqa: BLE001 - the relay is optional
+        return None
+    try:
+        started = (
+            start_background(port, endpoint)
+            if endpoint
+            else start_background(port)
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return relay_endpoint(port) if started else None
+
+
 def _browser_session_endpoint(args: argparse.Namespace) -> str | None:
     """Prefer the live browser unless a dedicated profile was explicitly selected."""
     explicit_endpoint = getattr(args, "cdp_url", None)
@@ -1323,6 +1871,82 @@ def _browser_session_endpoint(args: argparse.Namespace) -> str | None:
             args.browser, getattr(args, "chrome_user_data", None)
         )
     return None
+
+
+def _cdp_attach_help(report: dict, first_error: object | None = None) -> str:
+    lines = ["실사용 Chrome의 원격 디버깅 세션에 연결하지 못했습니다."]
+    pages = report.get("pages")
+    if pages:
+        lines.append(f"탭 {pages}개를 확인했습니다.")
+    stuck = report.get("remaining") or report.get("unresponsive") or []
+    if stuck:
+        lines.append(f"응답하지 않는 탭 {len(stuck)}개:")
+        for entry in stuck[:5]:
+            lines.append(f"  - {str(entry.get('url') or entry.get('title') or '')[:120]}")
+    lines.append("해결 방법:")
+    lines.append("  1) 주소창에 chrome://inspect/#remote-debugging 을 열고")
+    lines.append("     'Allow remote debugging for this browser instance'를 껐다가 다시 켜세요.")
+    lines.append("  2) 그래도 안 되면 Chrome을 완전히 종료한 뒤 다시 실행하세요(탭은 복원할 수 있습니다).")
+    if report.get("error"):
+        lines.append(f"점검 오류: {report['error']}")
+    if first_error is not None:
+        lines.append(f"최초 연결 오류: {first_error}")
+    return "\n".join(lines)
+
+
+def _connect_live_browser(playwright, endpoint: str):
+    """Attach to the running browser.
+
+    Playwright's ``connect_over_cdp`` waits for *every* existing tab during
+    initialization, so one frozen tab can turn into an endless ``Timeout`` even
+    though the browser is healthy. Chrome asks the user to allow remote
+    debugging for each connecting client, therefore this function opens at most
+    one connection: when the attach stalls it only reports what to do, unless
+    ``CG_ARCHIVE_CDP_REVIVE=1`` opted in to waking the stuck tabs.
+    """
+    try:
+        return playwright.chromium.connect_over_cdp(endpoint, timeout=_attach_timeout(endpoint))
+    except PlaywrightError as first_error:
+        if not _cdp_revive_enabled():
+            raise RuntimeError(
+                _cdp_attach_help({"ok": False}, first_error)
+            ) from first_error
+        print("실사용 브라우저 연결이 지연되어 응답 없는 탭을 점검합니다.")
+        report: dict = {"ok": False}
+        try:
+            from live_cdp import prepare_live_session
+
+            report = prepare_live_session(endpoint)
+        except Exception as error:  # noqa: BLE001 - diagnostics must not mask the real error
+            report = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+        revived = report.get("revived") or []
+        if revived:
+            print(f"응답 없던 탭 {len(revived)}개를 복구했습니다.")
+        if report.get("ok") is False:
+            # The debugging endpoint itself is not answering; a second attach
+            # would just stall for another minute.
+            raise RuntimeError(_cdp_attach_help(report, first_error)) from first_error
+        try:
+            return playwright.chromium.connect_over_cdp(
+                endpoint, timeout=_attach_timeout(endpoint)
+            )
+        except PlaywrightError:
+            raise RuntimeError(_cdp_attach_help(report, first_error)) from first_error
+
+
+def _attach_timeout(endpoint: str) -> int:
+    """Through the relay Chrome may still be waiting for its one-time Allow."""
+    if endpoint.startswith(f"ws://127.0.0.1:{RELAY_PORT}/"):
+        return 300_000
+    return 90_000
+
+
+def _cdp_revive_enabled() -> bool:
+    return os.environ.get("CG_ARCHIVE_CDP_REVIVE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def _open_browser_session(
@@ -1336,8 +1960,13 @@ def _open_browser_session(
     """
     endpoint = _browser_session_endpoint(args)
     if endpoint:
+        # Route through the relay so Chrome's per-client consent dialog only
+        # appears once per browser session instead of once per capture run.
+        relay = ensure_relay(endpoint)
+        if relay:
+            endpoint = relay
         print("실사용 브라우저의 원격 디버깅 세션에 연결합니다.")
-        browser = playwright.chromium.connect_over_cdp(endpoint, timeout=90_000)
+        browser = _connect_live_browser(playwright, endpoint)
         contexts = browser.contexts or [browser.new_context()]
         # Chrome can expose one context per profile. Prefer the profile that
         # already has a CoinGecko tab open, then fall back to the first one.
@@ -1350,6 +1979,12 @@ def _open_browser_session(
             except PlaywrightError:
                 continue
         page = context.new_page()
+        try:
+            # A background tab is throttled by Chrome, which made DOM reads
+            # (access-wall/login checks) time out on slower machines.
+            page.bring_to_front()
+        except PlaywrightError:
+            pass
         return browser, context, page, False
     if getattr(args, "attach", False) or getattr(args, "cdp_url", None):
         endpoint = getattr(args, "cdp_url", None) or chrome_debug_endpoint(
@@ -1611,6 +2246,24 @@ def _capture_coin(
                 details["screenshot"] = str(screenshot.relative_to(output_root))
                 details["capture_source"] = "website"
                 captured_target = True
+                try:
+                    attachments, issues = _download_pdf_attachments(
+                        page.content(),
+                        website,
+                        coin.name,
+                        coin.symbol,
+                        coin.url,
+                        pdf_dir,
+                        output_root,
+                        getattr(coin, "duplicate_index", 1),
+                    )
+                    if attachments:
+                        details["pdf_attachments"] = attachments
+                    details["review"].extend(issues)
+                except PlaywrightError as error:
+                    details["review"].append(
+                        f"pdf_attachment_scan_failed:{type(error).__name__}"
+                    )
         except AccessWallError:
             details["website_status"] = "access_blocked"
             details["review"].append("website_access_blocked")
@@ -1698,7 +2351,19 @@ def _capture_coin(
                     response = _navigate(page, whitepaper)
                     if response and response.status >= 400:
                         raise ValueError(f"whitepaper_http_{response.status}")
-                    _load_lazy_content(page)
+                    whitepaper_screenshot = output_path(
+                        screenshot_dir,
+                        coin.name,
+                        f"{coin.url}|{whitepaper}",
+                        "-whitepaper.png",
+                        coin.symbol,
+                        duplicate_index=getattr(coin, "duplicate_index", 1),
+                    )
+                    _save_full_page_screenshot(page, whitepaper_screenshot)
+                    details["whitepaper_screenshot"] = str(
+                        whitepaper_screenshot.relative_to(output_root)
+                    )
+                    whitepaper_html = page.content()
                     rendered_pdf = output_path(
                         pdf_dir,
                         coin.name,
@@ -1711,6 +2376,22 @@ def _capture_coin(
                     pending_site = None
                     details["pdf"] = str(rendered_pdf.relative_to(output_root))
                     details["whitepaper_result"] = "rendered_pdf"
+                    attachments, issues = _download_pdf_attachments(
+                        whitepaper_html,
+                        whitepaper,
+                        coin.name,
+                        coin.symbol,
+                        coin.url,
+                        pdf_dir,
+                        output_root,
+                        getattr(coin, "duplicate_index", 1),
+                    )
+                    if attachments:
+                        details["pdf_attachments"] = [
+                            *details.get("pdf_attachments", []),
+                            *attachments,
+                        ]
+                    details["review"].extend(issues)
                 except AccessWallError:
                     raise
                 except Exception as error:

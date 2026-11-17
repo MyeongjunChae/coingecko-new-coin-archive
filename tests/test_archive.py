@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import coingecko_archive as archive
+import bookmark_capture
 import web_app as web
 from coingecko_archive import (
     Coin,
@@ -14,6 +15,7 @@ from coingecko_archive import (
     deduplicate_coins,
     extract_coin_website,
     extract_explorer_links,
+    extract_pdf_attachment_links,
     extract_labeled_link,
     extract_twitter_link,
     is_complete,
@@ -264,6 +266,21 @@ def test_coin_link_rows_select_website_community_twitter_and_explorers():
     ]
 
 
+def test_coin_website_prefers_main_site_over_explorer_subdomain():
+    html = """
+    <div class="row">
+      <div>Website</div>
+      <div><a href="https://www.example.sh">example.sh</a>
+           <a href="https://explorer.example.sh">explorer.example.sh</a>
+           <a href="https://docs.example.sh">Whitepaper</a></div>
+    </div>
+    """
+    assert extract_coin_website(html, "https://www.coingecko.com/en/coins/example") == (
+        "https://www.example.sh",
+        "ok",
+    )
+
+
 def test_explorer_fallback_scans_known_hosts_without_labeled_row():
     html = """
     <a href="https://etherscan.io/token/1">Token explorer</a>
@@ -273,6 +290,128 @@ def test_explorer_fallback_scans_known_hosts_without_labeled_row():
     assert extract_explorer_links(html, "https://www.coingecko.com/en/coins/example") == [
         "https://etherscan.io/token/1"
     ]
+
+
+def test_extract_pdf_attachment_links_finds_only_pdf_documents():
+    html = """
+    <a href="/files/paper.PDF?download=1">Paper</a>
+    <a href="/download?id=42" type="application/pdf">Download</a>
+    <a href="/files/appendix" download="appendix.pdf">Appendix PDF</a>
+    <a href="/files/archive.zip">Archive</a>
+    <a href="javascript:void(0)">Script</a>
+    """
+
+    assert extract_pdf_attachment_links(html, "https://docs.example.com/page") == [
+        "https://docs.example.com/download?id=42",
+        "https://docs.example.com/files/appendix",
+        "https://docs.example.com/files/paper.PDF?download=1",
+    ]
+
+
+def test_download_pdf_attachments_saves_files_and_reports_failures(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_download(url, target):
+        seen.append(url)
+        if "blocked" in url:
+            raise archive.AccessWallError("HTTP 403")
+        return True, "pdf:application/pdf"
+
+    monkeypatch.setattr(archive, "_download_pdf", fake_download)
+    html = """
+    <a href="https://docs.example.com/guide.pdf">Guide</a>
+    <a href="https://docs.example.com/blocked.pdf">Blocked</a>
+    """
+
+    saved, issues = archive._download_pdf_attachments(
+        html,
+        "https://docs.example.com",
+        "Example",
+        "EX",
+        "https://coingecko.com/en/coins/example",
+        tmp_path / "pdf",
+        tmp_path,
+    )
+
+    assert len(saved) == 1
+    assert saved[0].endswith("-attachment-2.pdf")
+    assert seen == [
+        "https://docs.example.com/blocked.pdf",
+        "https://docs.example.com/guide.pdf",
+    ]
+    assert issues == ["pdf_attachment_access_blocked:1"]
+
+
+def test_bookmark_capture_rejects_local_and_non_web_urls(tmp_path):
+    source = tmp_path / "bookmarks.json"
+    source.write_text(
+        """[
+          {"title":"Public","url":"https://docs.example.com/guide"},
+          {"title":"Local","url":"http://127.0.0.1/admin"},
+          {"title":"Unsupported","url":"file:///secret.pdf"},
+          {"title":"Duplicate","url":"https://docs.example.com/guide"}
+        ]""",
+        encoding="utf-8",
+    )
+
+    assert bookmark_capture._safe_entries(source) == [
+        {"title": "Public", "url": "https://docs.example.com/guide"}
+    ]
+
+
+def test_web_bookmark_entry_validation_rejects_local_destinations():
+    entries = web._validate_bookmark_entries(
+        [
+            {"title": "Public", "url": "https://docs.example.com/guide"},
+            {"title": "Loopback", "url": "http://127.0.0.1/admin"},
+            {"title": "Localhost", "url": "http://localhost/private"},
+            {"title": "Invalid", "url": "javascript:alert(1)"},
+        ]
+    )
+
+    assert entries == [
+        {"title": "Public", "url": "https://docs.example.com/guide"}
+    ]
+
+
+def test_archive_zip_includes_bookmarked_document_captures(tmp_path):
+    original_output = web.OUTPUT_DIR
+    try:
+        web.configure(tmp_path)
+        screenshot = tmp_path / "archive" / "bookmarks" / "screenshots" / "page.png"
+        pdf = tmp_path / "archive" / "bookmarks" / "pdf" / "page.pdf"
+        attachment = tmp_path / "archive" / "bookmarks" / "pdf" / "attachment.pdf"
+        for path in (screenshot, pdf, attachment):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"test")
+        web.write_json(
+            tmp_path / ".state" / "manifest.json",
+            {
+                "version": 1,
+                "coins": {},
+                "pages": [],
+                "document_bookmarks": {
+                    "https://docs.example.com/guide": {
+                        "screenshot": "archive/bookmarks/screenshots/page.png",
+                        "pdf": "archive/bookmarks/pdf/page.pdf",
+                        "attachments": ["archive/bookmarks/pdf/attachment.pdf"],
+                    }
+                },
+            },
+        )
+
+        archive_path = web.build_zip("all")
+
+        import zipfile
+
+        with zipfile.ZipFile(archive_path) as bundle:
+            assert {
+                "archive/bookmarks/screenshots/page.png",
+                "archive/bookmarks/pdf/page.pdf",
+                "archive/bookmarks/pdf/attachment.pdf",
+            }.issubset(bundle.namelist())
+    finally:
+        web.configure(original_output)
 
 
 def test_deleted_twitter_page_is_detected_but_login_wall_is_not_misclassified():
@@ -551,7 +690,7 @@ def test_favorite_capacity_is_reused_between_capture_then_favorite_steps(monkeyp
 
     def portfolio_options(_page):
         calls["options"] += 1
-        return [{"number": 16, "href": "/en/portfolios/16", "label": "⭐ 16"}]
+        return [{"number": 16, "href": "/en/portfolios/16", "label": "⭐16"}]
 
     def portfolio_assets(*_args):
         calls["assets"] += 1
@@ -793,7 +932,7 @@ def test_output_path_includes_duplicate_suffix_for_same_name_entries(tmp_path):
     assert "example-2" in target.name
 
 
-def test_whitepaper_fallback_keeps_only_pdf_artifact(tmp_path, monkeypatch):
+def test_whitepaper_fallback_saves_screenshot_pdf_and_linked_attachments(tmp_path, monkeypatch):
     class FakeSession:
         def send(self, method, options):
             content = b"%PDF-1.7\n1 0 obj << /Type /Page >> endobj\n%%EOF"
@@ -808,6 +947,14 @@ def test_whitepaper_fallback_keeps_only_pdf_artifact(tmp_path, monkeypatch):
 
     class FakePage:
         context = FakeContext()
+
+        def content(self):
+            return "<html><body>Whitepaper</body></html>"
+
+        def screenshot(self, *, path, full_page, timeout):
+            assert full_page
+            assert timeout == 90_000
+            Path(path).write_bytes(b"png")
 
     monkeypatch.setattr(
         archive,
@@ -842,9 +989,9 @@ def test_whitepaper_fallback_keeps_only_pdf_artifact(tmp_path, monkeypatch):
     )
 
     assert pending is None
-    assert "whitepaper_screenshot" not in details
+    assert details["whitepaper_screenshot"].endswith("-whitepaper.png")
     assert details["pdf"].endswith("-whitepaper.pdf")
-    assert not (tmp_path / "whitepapers" / "Example-whitepaper.png").exists()
+    assert (tmp_path / details["whitepaper_screenshot"]).read_bytes() == b"png"
 
 
 def test_tokenized_stock_names_are_recognized_for_favorites_only_handling():
@@ -884,7 +1031,7 @@ def test_add_coins_to_favorites_uses_latest_portfolio_and_skips_duplicate_inputs
     monkeypatch.setattr(
         archive,
         "_portfolio_options",
-        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐ 16"}],
+        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐16"}],
     )
     monkeypatch.setattr(archive, "_portfolio_asset_urls", lambda *_args: set())
     monkeypatch.setattr(
@@ -968,7 +1115,7 @@ def test_add_coins_to_favorites_creates_next_portfolio_when_latest_is_full(monke
     monkeypatch.setattr(
         archive,
         "_portfolio_options",
-        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐ 16"}],
+        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐16"}],
     )
     monkeypatch.setattr(archive, "_portfolio_asset_urls", lambda *_args: {f"/en/coins/coin-{n}" for n in range(1000)})
     monkeypatch.setattr(
@@ -1002,7 +1149,7 @@ def test_add_coins_to_favorites_keeps_latest_portfolio_below_capacity(monkeypatc
     monkeypatch.setattr(
         archive,
         "_portfolio_options",
-        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐ 16"}],
+        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐16"}],
     )
     monkeypatch.setattr(archive, "_portfolio_asset_urls", lambda *_args: {f"/en/coins/coin-{n}" for n in range(999)})
     monkeypatch.setattr(
@@ -1049,7 +1196,7 @@ def test_add_coins_to_favorites_requires_folder_check_after_click(monkeypatch):
     monkeypatch.setattr(
         archive,
         "_portfolio_options",
-        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐ 16"}],
+        lambda _page: [{"number": 16, "href": "/en/portfolios/124912956", "label": "⭐16"}],
     )
     monkeypatch.setattr(archive, "_portfolio_asset_urls", lambda *_args: set())
     monkeypatch.setattr(
@@ -1064,12 +1211,12 @@ def test_add_coins_to_favorites_requires_folder_check_after_click(monkeypatch):
 
 
 def test_portfolio_folder_option_index_matches_exact_numeric_label():
-    labels = ["⭐ My Portfolio", "⭐ 2", "⭐ 6", "⭐ 16", "Portfolio 17"]
+    labels = ["⭐My Portfolio", "⭐2", "⭐6", "⭐16", "Portfolio 17"]
 
     assert archive._portfolio_folder_option_index(labels, 16) == 3
     assert archive._portfolio_folder_option_index(labels, 17) == 4
     assert archive._portfolio_folder_option_index(labels, 1) is None
-    assert archive._portfolio_label_number("⭐ 16") == 16
+    assert archive._portfolio_label_number("⭐16") == 16
     assert archive._portfolio_label_number("Portfolio 17") == 17
 
 
@@ -1109,7 +1256,7 @@ def test_click_portfolio_row_plus_targets_exact_numbered_detail_picker_row():
 
     class Rows:
         def __init__(self):
-            self.rows = [Row("⭐ 15", 15), Row("⭐ 16", 16)]
+            self.rows = [Row("⭐15", 15), Row("⭐16", 16)]
 
         def count(self):
             return len(self.rows)
@@ -1212,13 +1359,13 @@ def test_create_portfolio_uses_detail_picker_new_portfolio_action(monkeypatch):
     monkeypatch.setattr(
         archive,
         "_portfolio_options",
-        lambda _page: [{"number": 17, "href": "/en/portfolios/17", "label": "⭐ 17"}],
+        lambda _page: [{"number": 17, "href": "/en/portfolios/17", "label": "⭐17"}],
     )
 
     result = archive._create_portfolio(Page(), 17)
 
     assert state == {"clicked": True, "name": "17", "submitted": True}
-    assert result == {"number": 17, "href": "/en/portfolios/17", "label": "⭐ 17"}
+    assert result == {"number": 17, "href": "/en/portfolios/17", "label": "⭐17"}
 
 
 def test_portfolio_asset_urls_counts_unique_assets_across_pages(monkeypatch):
@@ -1427,3 +1574,150 @@ def test_empty_rendered_pdf_is_rejected_and_temporary_file_removed(tmp_path):
 
     assert not target.exists()
     assert not target.with_name(target.stem + ".part" + target.suffix).exists()
+
+
+def _runtime_error_from(action) -> str:
+    try:
+        action()
+    except RuntimeError as error:
+        return str(error)
+    raise AssertionError("RuntimeError was not raised.")
+
+
+def test_live_browser_attach_wakes_stuck_tabs_and_retries(monkeypatch):
+    import types
+
+    monkeypatch.setenv("CG_ARCHIVE_CDP_REVIVE", "1")
+    timeouts = []
+
+    class FakeChromium:
+        def __init__(self):
+            self.attempts = 0
+
+        def connect_over_cdp(self, endpoint, timeout=0):
+            timeouts.append(timeout)
+            self.attempts += 1
+            if self.attempts == 1:
+                raise archive.PlaywrightError("Timeout 90000ms exceeded.")
+            return "attached"
+
+    reports = []
+
+    def fake_prepare(endpoint):
+        reports.append(endpoint)
+        return {
+            "ok": True,
+            "pages": 12,
+            "unresponsive": [{"url": "https://example.com/frozen"}],
+            "revived": [{"url": "https://example.com/frozen"}],
+            "remaining": [],
+        }
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "live_cdp",
+        types.SimpleNamespace(prepare_live_session=fake_prepare),
+    )
+    playwright = types.SimpleNamespace(chromium=FakeChromium())
+
+    assert archive._connect_live_browser(playwright, "ws://example") == "attached"
+    assert timeouts == [90_000, 90_000]
+    assert reports == ["ws://example"]
+
+
+def test_live_browser_attach_reports_actionable_help_when_debug_endpoint_is_stuck(monkeypatch):
+    import types
+
+    monkeypatch.setenv("CG_ARCHIVE_CDP_REVIVE", "1")
+    timeouts = []
+
+    class FakeChromium:
+        def connect_over_cdp(self, endpoint, timeout=0):
+            timeouts.append(timeout)
+            raise archive.PlaywrightError("Timeout 90000ms exceeded.")
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "live_cdp",
+        types.SimpleNamespace(
+            prepare_live_session=lambda endpoint: {
+                "ok": False,
+                "error": "TimeoutError: no CDP reply",
+            }
+        ),
+    )
+    playwright = types.SimpleNamespace(chromium=FakeChromium())
+
+    message = _runtime_error_from(
+        lambda: archive._connect_live_browser(playwright, "ws://example")
+    )
+
+    assert timeouts == [90_000], "A dead debug endpoint must not be retried for a minute."
+    assert "chrome://inspect" in message
+    assert "TimeoutError: no CDP reply" in message
+
+
+def test_live_browser_attach_lists_tabs_that_stay_unresponsive(monkeypatch):
+    import types
+
+    monkeypatch.setenv("CG_ARCHIVE_CDP_REVIVE", "1")
+
+    class FakeChromium:
+        def connect_over_cdp(self, endpoint, timeout=0):
+            raise archive.PlaywrightError("Timeout 90000ms exceeded.")
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "live_cdp",
+        types.SimpleNamespace(
+            prepare_live_session=lambda endpoint: {
+                "ok": True,
+                "pages": 40,
+                "unresponsive": [{"url": "https://example.com/frozen"}],
+                "revived": [],
+                "remaining": [{"url": "https://example.com/frozen"}],
+            }
+        ),
+    )
+    playwright = types.SimpleNamespace(chromium=FakeChromium())
+
+    message = _runtime_error_from(
+        lambda: archive._connect_live_browser(playwright, "ws://example")
+    )
+
+    assert "탭 40개" in message
+    assert "https://example.com/frozen" in message
+    assert "chrome://inspect" in message
+
+
+def test_live_browser_attach_opens_only_one_connection_by_default(monkeypatch):
+    import types
+
+    monkeypatch.delenv("CG_ARCHIVE_CDP_REVIVE", raising=False)
+    probe_calls = []
+
+    def fake_prepare(endpoint):
+        probe_calls.append(endpoint)
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "live_cdp",
+        types.SimpleNamespace(prepare_live_session=fake_prepare),
+    )
+    attempts = []
+
+    class FakeChromium:
+        def connect_over_cdp(self, endpoint, timeout=0):
+            attempts.append(timeout)
+            raise archive.PlaywrightError("Timeout 90000ms exceeded.")
+
+    message = _runtime_error_from(
+        lambda: archive._connect_live_browser(
+            types.SimpleNamespace(chromium=FakeChromium()), "ws://example"
+        )
+    )
+
+    assert attempts == [90_000], "A failed attach must not keep re-connecting."
+    assert probe_calls == [], "Chrome's allow dialog must not be triggered by extra clients."
+    assert "chrome://inspect" in message
